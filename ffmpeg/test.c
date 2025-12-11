@@ -4,8 +4,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <assert.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
-static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
+static const char *url = "rtsp://localhost:8554/green";
+//#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static void error(const char *format, ...) {
 	va_list(args); 
@@ -94,35 +98,133 @@ static void close_input(InputContext *ictx) {
 	avcodec_free_context(&ictx->avctx);
 }
 
-// TODO : Must read in a thread, the frame reading seems to always block
-#define BUFSIZE 1
+#define BUFSIZE 16
+
+typedef struct PacketBuffer {
+	AVPacket *pkts[BUFSIZE];
+	pthread_mutex_t mutex;
+	int wpos;
+	int rpos;
+	int count;
+} PacketBuffer;
+
+typedef struct DecoderContext {
+	time_t atomic_heartbeat;
+	enum AVCodecID codec_id;
+	PacketBuffer *buf;
+	AVCodecContext *avctx;
+} DecoderContext;
+
+static void decoder_update_heartbeat(DecoderContext *ctx) {
+	__sync_lock_test_and_set(&ctx, time(NULL));
+}
+
+static void *decoder_main(void *arg) {
+	int err;
+	DecoderContext *ctx = arg;
+	PacketBuffer *buf = ctx->buf;
+	AVFrame *frame = NULL;
+	AVPacket *packet = NULL;
+
+	frame = av_frame_alloc();
+	if (!frame) {
+		error("Failed to allocate frame\n");
+		goto fail;
+	}
+
+	for (;;) {
+		packet = av_packet_alloc();
+		if (!packet) {
+			error("Failed to allocate packet\n");
+			goto fail;
+		}
+
+		pthread_mutex_lock(&buf->mutex);
+		if (buf->count == 0) {
+			pthread_mutex_unlock(&buf->mutex);
+			usleep(10 * 1000);
+			continue;
+		}
+		av_packet_ref(packet, buf->pkts[buf->rpos]);
+		av_packet_unref(buf->pkts[buf->rpos]);
+		buf->rpos = (buf->rpos + 1) % BUFSIZE;
+		buf->count--;
+		pthread_mutex_unlock(&buf->mutex);
+
+		again:
+		err = avcodec_send_packet(ctx->avctx, packet);
+		if (err == AVERROR(EAGAIN)) {
+			error("avcodec_send_packet dropped packet\n");
+			usleep(100 * 1000);
+			goto again;
+		}
+		av_packet_free(&packet);
+
+		for (;;) {
+			err = avcodec_receive_frame(ctx->avctx, frame);
+			if (err == AVERROR(EAGAIN)) {
+				// No frames
+				break;
+			}
+			else if (err >= 0) {
+				info("Got a frame\n");
+				av_frame_unref(frame);
+			}
+			else {
+				error("avcodec_receive_frame failed: %s\n", av_err2str(err));
+				goto fail;
+			}
+		}
+	}
+
+	fail:
+		av_packet_free(&packet);
+		av_frame_free(&frame);
+		return (void *) 1;
+}
+
+static int check_decoder_ok(DecoderContext *ctx) {
+	time_t heartbeat = __sync_fetch_and_add(&ctx->atomic_heartbeat, 0);
+	if (time(NULL) - heartbeat > 5) {
+		error("Heartbeat timeout for decoder thread");
+		return 1;
+	}
+	return 0;
+}
 
 int main(int argc, const char **argv) {
 	int err, ret = 0;
 
 	InputContext ictx;
 	const AVCodec *codec;
-	AVPacket *pkts[BUFSIZE] = {0};
-	AVFrame *frame = NULL;
 	AVStream *stream;
-	int pkt_wpos = 0, pkt_rpos = 0, pkt_count = 0;
+	pthread_t decoder;
+	void *res;
+	PacketBuffer buf = {0};
+	AVPacket *packet = NULL;
+
+	err = pthread_mutex_init(&buf.mutex, NULL);
+	if (err) {
+		error("Failed to initialize mutex");
+		abort();
+	}
+
+	packet = av_packet_alloc();
+	if (!packet) {
+		error("Failed to allocate packet\n");
+		goto fail;
+	}
 
 	err = open_input(&ictx, url);
 	if (err < 0)
 		goto fail;
 
 	for (int i = 0; i < BUFSIZE; i++) {
-		pkts[i] = av_packet_alloc();
-		if (!pkts[i]) {
+		buf.pkts[i] = av_packet_alloc();
+		if (!buf.pkts[i]) {
 			error("Failed to allocate packet\n");
 			goto fail;
 		}
-	}
-
-	frame = av_frame_alloc();
-	if (!frame) {
-		error("Failed to allocate frame\n");
-		goto fail;
 	}
 
 	stream = ictx.ic->streams[0];
@@ -152,18 +254,20 @@ int main(int argc, const char **argv) {
 	if (err < 0)
 		goto fail;
 
-	int max = 10;
+	DecoderContext decoder_ctx = {
+		.atomic_heartbeat = time(NULL),
+		.avctx = ictx.avctx,
+		.buf = &buf
+	};
+
+	pthread_create(&decoder, NULL, decoder_main, &decoder_ctx);
+
 	for (;;) {
-		if (--max == 0)
-			break;
+		if (check_decoder_ok(&decoder_ctx))
+			goto fail;
 
 		for (;;) {
-			if (pkt_count == BUFSIZE) {
-				error("Packet buffer full\n");
-				break;
-			}
-
-			err = av_read_frame(ictx.ic, pkts[pkt_wpos]);
+			err = av_read_frame(ictx.ic, packet);
 			if (err < 0) {
 				if (err == AVERROR(EAGAIN))
 					break;
@@ -171,42 +275,21 @@ int main(int argc, const char **argv) {
 				goto fail;
 			}
 			else {
-				info("Read pkt size %d wpos %d rpos %d count %d\n", pkts[pkt_wpos]->size, pkt_wpos, pkt_rpos, pkt_count);
-				pkt_wpos = (pkt_wpos + 1) % BUFSIZE;
-				pkt_count++;
-			}
-		}
-
-		for (;;) {
-			if (pkt_count == 0) {
-				error("Packet buffer empty\n");
-				break;
-			}
-
-			err = avcodec_send_packet(ictx.avctx, pkts[pkt_rpos]);
-			if (err == AVERROR(EAGAIN)) {
-				error("avcodec_send_packet dropped packet\n");
-				goto fail;
-			}
-			av_packet_unref(pkts[pkt_rpos]);
-
-			pkt_rpos = (pkt_rpos + 1) % BUFSIZE;
-			pkt_count--;
-
-			for (;;) {
-				err = avcodec_receive_frame(ictx.avctx, frame);
-				if (err == AVERROR(EAGAIN)) {
-					// No frames
-					break;
+				retry:
+				pthread_mutex_lock(&buf.mutex);
+				if (buf.count == BUFSIZE) {
+					error("Packet buffer full\n");
+					pthread_mutex_unlock(&buf.mutex);
+					usleep(100 * 1000);
+					goto retry;
 				}
-				else if (err >= 0) {
-					info("Got a frame\n");
-					av_frame_unref(frame);
-				}
-				else {
-					error("avcodec_receive_frame failed: %s\n", av_err2str(err));
-					goto fail;
-				}
+				av_packet_move_ref(buf.pkts[buf.wpos], packet);
+				buf.wpos = (buf.wpos + 1) % BUFSIZE;
+				buf.count++;
+
+				info("Read pkt size %d wpos %d rpos %d count %d\n", buf.pkts[buf.wpos]->size, buf.wpos, buf.rpos, buf.count);
+
+				pthread_mutex_unlock(&buf.mutex);
 			}
 		}
 	}
@@ -215,9 +298,12 @@ int main(int argc, const char **argv) {
 	fail:
 		ret = -1;
 	out:
-		av_frame_free(&frame);
+		av_packet_free(&packet);
+		pthread_mutex_lock(&buf.mutex);
 		for (int i = 0; i < BUFSIZE; i++)
-			av_packet_free(&pkts[i]);
+			av_packet_free(&buf.pkts[i]);
+		pthread_mutex_unlock(&buf.mutex);
 		close_input(&ictx);
+		pthread_mutex_destroy(&buf.mutex);
 		return ret;
 }
