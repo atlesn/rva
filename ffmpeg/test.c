@@ -7,9 +7,12 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
-static const char *url = "rtsp://localhost:8554/green";
+static const char *url = "rtsp://localhost:8554/test";
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
+
+static volatile int stop_now = 0;
 
 static void error(const char *format, ...) {
 	va_list(args); 
@@ -133,11 +136,8 @@ static void *decoder_main(void *arg) {
 	}
 
 	for (;;) {
-		packet = av_packet_alloc();
-		if (!packet) {
-			error("Failed to allocate packet\n");
-			goto fail;
-		}
+		if (stop_now)
+			goto done;
 
 		pthread_mutex_lock(&buf->mutex);
 		if (buf->count == 0) {
@@ -145,13 +145,24 @@ static void *decoder_main(void *arg) {
 			usleep(10 * 1000);
 			continue;
 		}
+
+		packet = av_packet_alloc();
+		if (!packet) {
+			error("Failed to allocate packet\n");
+			goto fail;
+		}
+
 		av_packet_ref(packet, buf->pkts[buf->rpos]);
 		av_packet_unref(buf->pkts[buf->rpos]);
 		buf->rpos = (buf->rpos + 1) % BUFSIZE;
 		buf->count--;
+
 		pthread_mutex_unlock(&buf->mutex);
 
 		again:
+		if (stop_now)
+			goto done;
+
 		err = avcodec_send_packet(ctx->avctx, packet);
 		if (err == AVERROR(EAGAIN)) {
 			error("avcodec_send_packet dropped packet\n");
@@ -177,6 +188,9 @@ static void *decoder_main(void *arg) {
 		}
 	}
 
+	done:
+	info("Decoder thread exiting\n");
+
 	fail:
 		av_packet_free(&packet);
 		av_frame_free(&frame);
@@ -192,6 +206,27 @@ static int check_decoder_ok(DecoderContext *ctx) {
 	return 0;
 }
 
+static void signal_handler(int sig) {
+	switch (sig) {
+		case SIGTERM:
+			info("Received SIGTERM\n");
+			break;
+		case SIGINT:
+			info("Received SIGINT\n");
+			break;
+		default:
+			assert(0 && "Unknown signal");
+			abort();
+	};
+
+	if (stop_now) {
+		error("Received second signal, quit now\n");
+		exit(1);
+	}
+
+	stop_now = 1;
+}
+
 int main(int argc, const char **argv) {
 	int err, ret = 0;
 
@@ -202,6 +237,16 @@ int main(int argc, const char **argv) {
 	void *res;
 	PacketBuffer buf = {0};
 	AVPacket *packet = NULL;
+	int thread_running = 0;
+
+	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
+		error("Failed to bind signal handler");
+		abort();
+	}
+	if (signal(SIGINT, signal_handler) == SIG_ERR) {
+		error("Failed to bind signal handler");
+		abort();
+	}
 
 	err = pthread_mutex_init(&buf.mutex, NULL);
 	if (err) {
@@ -260,7 +305,12 @@ int main(int argc, const char **argv) {
 		.buf = &buf
 	};
 
-	pthread_create(&decoder, NULL, decoder_main, &decoder_ctx);
+	err = pthread_create(&decoder, NULL, decoder_main, &decoder_ctx);
+	if (err) {
+		error("Failed to start decoder thread\n");
+		goto fail;
+	}
+	thread_running = 1;
 
 	for (;;) {
 		if (check_decoder_ok(&decoder_ctx))
@@ -276,6 +326,9 @@ int main(int argc, const char **argv) {
 			}
 			else {
 				retry:
+				if (stop_now)
+					goto done;
+
 				pthread_mutex_lock(&buf.mutex);
 				if (buf.count == BUFSIZE) {
 					error("Packet buffer full\n");
@@ -294,10 +347,18 @@ int main(int argc, const char **argv) {
 		}
 	}
 
+	done:
+
 	goto out;
 	fail:
 		ret = -1;
 	out:
+		stop_now = 1;
+		info("Main thread exiting\n");
+		if (thread_running) {
+			pthread_join(decoder, NULL);
+			info("Joined with decoder thread\n");
+		}
 		av_packet_free(&packet);
 		pthread_mutex_lock(&buf.mutex);
 		for (int i = 0; i < BUFSIZE; i++)
