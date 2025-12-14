@@ -200,7 +200,7 @@ static void *decoder_main(void *arg) {
 static int check_decoder_ok(DecoderContext *ctx) {
 	time_t heartbeat = __sync_fetch_and_add(&ctx->atomic_heartbeat, 0);
 	if (time(NULL) - heartbeat > 5) {
-		error("Heartbeat timeout for decoder thread");
+		error("Heartbeat timeout for decoder thread\n");
 		return 1;
 	}
 	return 0;
@@ -313,9 +313,6 @@ int main(int argc, const char **argv) {
 	thread_running = 1;
 
 	for (;;) {
-		if (check_decoder_ok(&decoder_ctx))
-			goto fail;
-
 		for (;;) {
 			err = av_read_frame(ictx.ic, packet);
 			if (err < 0) {
@@ -329,7 +326,13 @@ int main(int argc, const char **argv) {
 				if (stop_now)
 					goto done;
 
+				if (check_decoder_ok(&decoder_ctx)) {
+					pthread_cancel(decoder);
+					goto fail;
+				}
+
 				pthread_mutex_lock(&buf.mutex);
+
 				if (buf.count == BUFSIZE) {
 					error("Packet buffer full\n");
 					pthread_mutex_unlock(&buf.mutex);
