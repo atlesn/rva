@@ -132,6 +132,11 @@ static void close_input(InputContext *ictx) {
 	buf->count == 0
 
 #define BUF_ALLOC(buf, alloc)                         \
+	err = pthread_mutex_init(&buf.mutex, NULL);   \
+	if (err) {                                    \
+		error("Failed to initialize mutex");  \
+		abort();                              \
+	}                                             \
 	for (int i = 0; i < BUFSIZE; i++) {           \
 	  buf.entries[i] = alloc();                   \
 	    if (!buf.entries[i]) {                    \
@@ -145,7 +150,8 @@ static void close_input(InputContext *ictx) {
 	for (int i = 0; i < BUFSIZE; i++) {   \
 	  free(&buf.entries[i]);              \
 	}                                     \
-	pthread_mutex_unlock(&buf.mutex);
+	pthread_mutex_unlock(&buf.mutex);     \
+	pthread_mutex_destroy(&buf.mutex)
 
 typedef struct PacketBuffer {
 	BUFMEMBERS(AVPacket)
@@ -247,13 +253,20 @@ enum ThreadIndex {
 	pthread_mutex_unlock(&buf->mutex);
 
 typedef struct EncoderContext {
+	FrameBuffer *buf;
 } EncoderContext;
 
 static int encoder_main(ThreadContext *thread, void *arg) {
 	int ret = 0;
 	EncoderContext *ctx = arg;
+	FrameBuffer *buf = ctx->buf;
 
-	usleep(4 * 1000 * 1000);
+	for (;;) {
+		THREAD_WITH_BUF_READ(thread, buf, AVFrame,
+			av_frame_unref(entry);
+			info("Read frame wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
+		);
+	}
 
 	goto done;
 	fail:
@@ -427,12 +440,6 @@ int main(int argc, const char **argv) {
 		abort();
 	}
 
-	err = pthread_mutex_init(&packet_buf.mutex, NULL);
-	if (err) {
-		error("Failed to initialize mutex");
-		abort();
-	}
-
 	err = open_input(&ictx, url);
 	if (err < 0)
 		goto fail;
@@ -487,6 +494,7 @@ int main(int argc, const char **argv) {
 	threads[THREAD_DECODER].name = "decoder thread";
 
 	EncoderContext encoder_ctx = {
+		.buf = &frame_buf
 	};
 
 	threads[THREAD_ENCODER].arg = &encoder_ctx;
@@ -543,6 +551,5 @@ int main(int argc, const char **argv) {
 		BUF_FREE(frame_buf, AVFrame, av_frame_free);
 		BUF_FREE(packet_buf, AVPacket, av_packet_free);
 		close_input(&ictx);
-		pthread_mutex_destroy(&packet_buf.mutex);
 		return ret;
 }
