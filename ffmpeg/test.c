@@ -131,6 +131,22 @@ static void close_input(InputContext *ictx) {
 #define BUF_EMPTY(buf) \
 	buf->count == 0
 
+#define BUF_ALLOC(buf, alloc)                         \
+	for (int i = 0; i < BUFSIZE; i++) {           \
+	  buf.entries[i] = alloc();                   \
+	    if (!buf.entries[i]) {                    \
+	      error("Failed to allocate entry\n");    \
+	      goto fail;                              \
+	    }                                         \
+	}
+
+#define BUF_FREE(buf, type, free)             \
+	pthread_mutex_lock(&buf.mutex);      \
+	for (int i = 0; i < BUFSIZE; i++) {   \
+	  free(&buf.entries[i]);              \
+	}                                     \
+	pthread_mutex_unlock(&buf.mutex);
+
 typedef struct PacketBuffer {
 	BUFMEMBERS(AVPacket)
 } PacketBuffer;
@@ -195,16 +211,20 @@ enum ThreadIndex {
 	THREAD_COUNT
 };
 
+#define PASTE(a,b) a ## b
+
+#define QUOTE(a) #a
+
 #define THREAD_WITH_BUF_WRITE(thread, buf, type, task) \
-	retry:                                  \
+	PASTE(type,retry):                      \
 	if (stop_now) goto done;                \
 	thread_heartbeat(thread);               \
 	pthread_mutex_lock(&buf->mutex);        \
 	if (BUF_FULL(buf)) {                    \
-	  error("Buffer full");                 \
+	  error("Buffer for " QUOTE(type) " full\n"); \
 	  pthread_mutex_unlock(&buf->mutex);    \
 	  usleep(100 * 1000);                   \
-	  goto retry;                           \
+	  goto PASTE(type,retry);               \
 	}                                       \
 	BUF_WRITE_BEGIN(buf, type);             \
 	task                                    \
@@ -245,14 +265,14 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 typedef struct DecoderContext {
 	enum AVCodecID codec_id;
-	PacketBuffer *buf;
+	PacketBuffer *packet_buf;
+	FrameBuffer *frame_buf;
 	AVCodecContext *avctx;
 } DecoderContext;
 
 static int decoder_main(ThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	DecoderContext *ctx = arg;
-	PacketBuffer *buf = ctx->buf;
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
 
@@ -263,7 +283,7 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 	}
 
 	for (;;) {
-		THREAD_WITH_BUF_READ(thread, buf, AVPacket,
+		THREAD_WITH_BUF_READ(thread, ctx->packet_buf, AVPacket,
 			packet = av_packet_alloc();
 			if (!packet) {
 				error("Failed to allocate packet\n");
@@ -294,8 +314,9 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 				break;
 			}
 			else if (err >= 0) {
-				info("Got a frame\n");
-				av_frame_unref(frame);
+				THREAD_WITH_BUF_WRITE(thread, ctx->frame_buf, AVFrame,
+					av_frame_move_ref(entry, frame);
+				);
 			}
 			else {
 				error("avcodec_receive_frame failed: %s\n", av_err2str(err));
@@ -344,7 +365,7 @@ static int reader_main(ThreadContext *thread, void *arg) {
 			else {
 				THREAD_WITH_BUF_WRITE(thread, buf, AVPacket,
 					av_packet_move_ref(entry, packet);
-					info("Read pkt size %d wpos %d rpos %d count %d\n", entry, buf->wpos, buf->rpos, buf->count);
+					info("Read pkt size %d wpos %d rpos %d count %d\n", entry->size, buf->wpos, buf->rpos, buf->count);
 				);
 			}
 		}
@@ -391,7 +412,8 @@ int main(int argc, const char **argv) {
 	const AVCodec *codec;
 	AVStream *stream;
 	void *res;
-	PacketBuffer buf = {0};
+	PacketBuffer packet_buf = {0};
+	FrameBuffer frame_buf = {0};
 	ThreadContext threads[THREAD_COUNT];
 
 	memset(threads, '\0', sizeof(threads));
@@ -405,7 +427,7 @@ int main(int argc, const char **argv) {
 		abort();
 	}
 
-	err = pthread_mutex_init(&buf.mutex, NULL);
+	err = pthread_mutex_init(&packet_buf.mutex, NULL);
 	if (err) {
 		error("Failed to initialize mutex");
 		abort();
@@ -415,13 +437,8 @@ int main(int argc, const char **argv) {
 	if (err < 0)
 		goto fail;
 
-	for (int i = 0; i < BUFSIZE; i++) {
-		buf.entries[i] = av_packet_alloc();
-		if (!buf.entries[i]) {
-			error("Failed to allocate packet\n");
-			goto fail;
-		}
-	}
+	BUF_ALLOC(packet_buf, av_packet_alloc);
+	BUF_ALLOC(frame_buf, av_frame_alloc);
 
 	stream = ictx.ic->streams[0];
 
@@ -452,7 +469,7 @@ int main(int argc, const char **argv) {
 
 	ReaderContext reader_ctx = {
 		.ic = ictx.ic,
-		.buf = &buf
+		.buf = &packet_buf
 	};
 
 	threads[THREAD_READER].arg = &reader_ctx;
@@ -461,7 +478,8 @@ int main(int argc, const char **argv) {
 
 	DecoderContext decoder_ctx = {
 		.avctx = ictx.avctx,
-		.buf = &buf
+		.packet_buf = &packet_buf,
+		.frame_buf = &frame_buf
 	};
 
 	threads[THREAD_DECODER].arg = &decoder_ctx;
@@ -522,11 +540,9 @@ int main(int argc, const char **argv) {
 					ret = -1;
 			}
 		}
-		pthread_mutex_lock(&buf.mutex);
-		for (int i = 0; i < BUFSIZE; i++)
-			av_packet_free(&buf.entries[i]);
-		pthread_mutex_unlock(&buf.mutex);
+		BUF_FREE(frame_buf, AVFrame, av_frame_free);
+		BUF_FREE(packet_buf, AVPacket, av_packet_free);
 		close_input(&ictx);
-		pthread_mutex_destroy(&buf.mutex);
+		pthread_mutex_destroy(&packet_buf.mutex);
 		return ret;
 }
