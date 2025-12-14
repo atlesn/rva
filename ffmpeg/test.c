@@ -136,16 +136,31 @@ static Heartbeat make_heartbeat(void) {
 	return hb;
 }
 
+typedef struct ThreadContext {
+	Heartbeat heartbeat;
+	pthread_t thread;
+	const char *name;
+	void *(*entry)(void *);
+	int running;
+	void *arg;
+} ThreadContext;
+
+enum ThreadIndex {
+	THREAD_READER,
+	THREAD_DECODER,
+	THREAD_COUNT
+};
+
 typedef struct DecoderContext {
 	enum AVCodecID codec_id;
 	PacketBuffer *buf;
 	AVCodecContext *avctx;
-	Heartbeat heartbeat;
 } DecoderContext;
 
 static void *decoder_main(void *arg) {
 	int err, ret = 0;
-	DecoderContext *ctx = arg;
+	ThreadContext *thread = arg;
+	DecoderContext *ctx = thread->arg;
 	PacketBuffer *buf = ctx->buf;
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
@@ -184,7 +199,7 @@ static void *decoder_main(void *arg) {
 		if (stop_now)
 			goto done;
 
-		update_heartbeat(&ctx->heartbeat);
+		update_heartbeat(&thread->heartbeat);
 
 		err = avcodec_send_packet(ctx->avctx, packet);
 		if (err == AVERROR(EAGAIN)) {
@@ -225,12 +240,12 @@ static void *decoder_main(void *arg) {
 typedef struct ReaderContext {
 	AVFormatContext *ic;
 	PacketBuffer *buf;
-	Heartbeat heartbeat;
 } ReaderContext;
 
 static void *reader_main(void *arg) {
 	int err, ret = 0;
-	ReaderContext *ctx = arg;
+	ThreadContext *thread = arg;
+	ReaderContext *ctx = thread->arg;
 	PacketBuffer *buf = ctx->buf;
 	AVPacket *packet = NULL;
 
@@ -254,7 +269,7 @@ static void *reader_main(void *arg) {
 				if (stop_now)
 					goto done;
 
-				update_heartbeat(&ctx->heartbeat);
+				update_heartbeat(&thread->heartbeat);
 
 				pthread_mutex_lock(&buf->mutex);
 
@@ -312,10 +327,11 @@ int main(int argc, const char **argv) {
 	InputContext ictx = {0};
 	const AVCodec *codec;
 	AVStream *stream;
-	pthread_t reader, decoder;
 	void *res;
 	PacketBuffer buf = {0};
-	int reader_thread_running = 0, decoder_thread_running = 0;
+	ThreadContext threads[THREAD_COUNT];
+
+	memset(threads, '\0', sizeof(threads));
 
 	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
 		error("Failed to bind signal handler");
@@ -372,39 +388,47 @@ int main(int argc, const char **argv) {
 		goto fail;
 
 	ReaderContext reader_ctx = {
-		.heartbeat = make_heartbeat(),
 		.ic = ictx.ic,
 		.buf = &buf
 	};
 
-	err = pthread_create(&reader, NULL, reader_main, &reader_ctx);
-	if (err) {
-		error("Failed to start reader thread\n");
-		goto fail;
-	}
-	reader_thread_running = 1;
+	threads[THREAD_READER].arg = &reader_ctx;
+	threads[THREAD_READER].entry = reader_main;
+	threads[THREAD_READER].name = "reader thread";
 
 	DecoderContext decoder_ctx = {
-		.heartbeat = make_heartbeat(),
 		.avctx = ictx.avctx,
 		.buf = &buf
 	};
 
-	err = pthread_create(&decoder, NULL, decoder_main, &decoder_ctx);
-	if (err) {
-		error("Failed to start decoder thread\n");
-		goto fail;
-	}
-	decoder_thread_running = 1;
+	threads[THREAD_DECODER].arg = &decoder_ctx;
+	threads[THREAD_DECODER].entry = decoder_main;
+	threads[THREAD_DECODER].name = "decoder thread";
 
-	for (;;) {
-		if (check_heartbeat(&reader_ctx.heartbeat, "reader thread")) {
-			pthread_cancel(decoder);
+	for (int i = 0; i < THREAD_COUNT; i++) {
+		ThreadContext *thread = &threads[i];
+
+		info("Starting %s\n", thread->name);
+
+		thread->heartbeat = make_heartbeat();
+
+		err = pthread_create(&thread->thread, NULL, thread->entry, thread);
+		if (err) {
+			error("Failed to start %s\n", thread->name);
 			goto fail;
 		}
-		if (check_heartbeat(&decoder_ctx.heartbeat, "decoder thread")) {
-			pthread_cancel(decoder);
-			goto fail;
+
+		thread->running = 1;
+	}
+
+	for (;;) {
+		for (int i = 0; i < THREAD_COUNT; i++) {
+			ThreadContext *thread = &threads[i];
+
+			if (check_heartbeat(&thread->heartbeat, thread->name)) {
+				pthread_cancel(thread->thread);
+				goto fail;
+			}
 		}
 		if (stop_now || thread_exited) {
 			break;
@@ -416,19 +440,17 @@ int main(int argc, const char **argv) {
 	fail:
 		ret = -1;
 	out:
-		stop_now = 1;
 		info("Main thread exiting\n");
-		if (reader_thread_running) {
-			pthread_join(reader, &res);
-			info("Joined with reader thread\n");
-			if ((intptr_t) res)
-				ret = -1;
-		}
-		if (decoder_thread_running) {
-			pthread_join(decoder, &res);
-			info("Joined with decoder thread\n");
-			if ((intptr_t) res)
-				ret = -1;
+		stop_now = 1;
+		for (int i = 0; i < THREAD_COUNT; i++) {
+			ThreadContext *thread = &threads[i];
+
+			if (thread->running) {
+				pthread_join(thread->thread, &res);
+				info("Joined with %s\n", thread->name);
+				if ((intptr_t) res)
+					ret = -1;
+			}
 		}
 		pthread_mutex_lock(&buf.mutex);
 		for (int i = 0; i < BUFSIZE; i++)
