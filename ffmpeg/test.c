@@ -13,6 +13,7 @@ static const char *url = "rtsp://localhost:8554/test";
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
+static volatile int thread_exited = 0;
 
 static void error(const char *format, ...) {
 	va_list(args); 
@@ -111,19 +112,39 @@ typedef struct PacketBuffer {
 	int count;
 } PacketBuffer;
 
-typedef struct DecoderContext {
+typedef struct Heartbeat {
 	time_t atomic_heartbeat;
+} Heartbeat;
+
+static void update_heartbeat(Heartbeat *hb) {
+	__sync_lock_test_and_set(&hb->atomic_heartbeat, time(NULL));
+}
+
+static int check_heartbeat(Heartbeat *hb, const char *who) {
+	time_t heartbeat = __sync_fetch_and_add(&hb->atomic_heartbeat, 0);
+	if (time(NULL) - heartbeat > 5) {
+		error("Heartbeat timeout for %s\n", who);
+		return 1;
+	}
+	return 0;
+}
+
+static Heartbeat make_heartbeat(void) {
+	Heartbeat hb = {
+		.atomic_heartbeat = time(NULL)
+	};
+	return hb;
+}
+
+typedef struct DecoderContext {
 	enum AVCodecID codec_id;
 	PacketBuffer *buf;
 	AVCodecContext *avctx;
+	Heartbeat heartbeat;
 } DecoderContext;
 
-static void decoder_update_heartbeat(DecoderContext *ctx) {
-	__sync_lock_test_and_set(&ctx, time(NULL));
-}
-
 static void *decoder_main(void *arg) {
-	int err;
+	int err, ret = 0;
 	DecoderContext *ctx = arg;
 	PacketBuffer *buf = ctx->buf;
 	AVFrame *frame = NULL;
@@ -163,6 +184,8 @@ static void *decoder_main(void *arg) {
 		if (stop_now)
 			goto done;
 
+		update_heartbeat(&ctx->heartbeat);
+
 		err = avcodec_send_packet(ctx->avctx, packet);
 		if (err == AVERROR(EAGAIN)) {
 			error("avcodec_send_packet dropped packet\n");
@@ -188,22 +211,78 @@ static void *decoder_main(void *arg) {
 		}
 	}
 
-	done:
-	info("Decoder thread exiting\n");
-
+	goto done;
 	fail:
+		ret = 1;
+	done:
+		info("Decoder thread exiting\n");
 		av_packet_free(&packet);
 		av_frame_free(&frame);
-		return (void *) 1;
+		thread_exited = 1;
+		return (void *) (intptr_t) ret;
 }
 
-static int check_decoder_ok(DecoderContext *ctx) {
-	time_t heartbeat = __sync_fetch_and_add(&ctx->atomic_heartbeat, 0);
-	if (time(NULL) - heartbeat > 5) {
-		error("Heartbeat timeout for decoder thread\n");
-		return 1;
+typedef struct ReaderContext {
+	AVFormatContext *ic;
+	PacketBuffer *buf;
+	Heartbeat heartbeat;
+} ReaderContext;
+
+static void *reader_main(void *arg) {
+	int err, ret = 0;
+	ReaderContext *ctx = arg;
+	PacketBuffer *buf = ctx->buf;
+	AVPacket *packet = NULL;
+
+	packet = av_packet_alloc();
+	if (!packet) {
+		error("Failed to allocate packet\n");
+		goto fail;
 	}
-	return 0;
+
+	for (;;) {
+		for (;;) {
+			err = av_read_frame(ctx->ic, packet);
+			if (err < 0) {
+				if (err == AVERROR(EAGAIN))
+					break;
+				error("Failed to read frame: %s\n", av_err2str(err));
+				goto fail;
+			}
+			else {
+				retry:
+				if (stop_now)
+					goto done;
+
+				update_heartbeat(&ctx->heartbeat);
+
+				pthread_mutex_lock(&buf->mutex);
+
+				if (buf->count == BUFSIZE) {
+					error("Packet buffer full\n");
+					pthread_mutex_unlock(&buf->mutex);
+					usleep(100 * 1000);
+					goto retry;
+				}
+				av_packet_move_ref(buf->pkts[buf->wpos], packet);
+				buf->wpos = (buf->wpos + 1) % BUFSIZE;
+				buf->count++;
+
+				info("Read pkt size %d wpos %d rpos %d count %d\n", buf->pkts[buf->wpos]->size, buf->wpos, buf->rpos, buf->count);
+
+				pthread_mutex_unlock(&buf->mutex);
+			}
+		}
+	}
+
+	goto done;
+	fail:
+		ret = 1;
+	done:
+		info("Reader thread exiting\n");
+		av_packet_free(&packet);
+		thread_exited = 1;
+		return (void *) (intptr_t) ret;
 }
 
 static void signal_handler(int sig) {
@@ -230,14 +309,13 @@ static void signal_handler(int sig) {
 int main(int argc, const char **argv) {
 	int err, ret = 0;
 
-	InputContext ictx;
+	InputContext ictx = {0};
 	const AVCodec *codec;
 	AVStream *stream;
-	pthread_t decoder;
+	pthread_t reader, decoder;
 	void *res;
 	PacketBuffer buf = {0};
-	AVPacket *packet = NULL;
-	int thread_running = 0;
+	int reader_thread_running = 0, decoder_thread_running = 0;
 
 	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
 		error("Failed to bind signal handler");
@@ -252,12 +330,6 @@ int main(int argc, const char **argv) {
 	if (err) {
 		error("Failed to initialize mutex");
 		abort();
-	}
-
-	packet = av_packet_alloc();
-	if (!packet) {
-		error("Failed to allocate packet\n");
-		goto fail;
 	}
 
 	err = open_input(&ictx, url);
@@ -299,8 +371,21 @@ int main(int argc, const char **argv) {
 	if (err < 0)
 		goto fail;
 
+	ReaderContext reader_ctx = {
+		.heartbeat = make_heartbeat(),
+		.ic = ictx.ic,
+		.buf = &buf
+	};
+
+	err = pthread_create(&reader, NULL, reader_main, &reader_ctx);
+	if (err) {
+		error("Failed to start reader thread\n");
+		goto fail;
+	}
+	reader_thread_running = 1;
+
 	DecoderContext decoder_ctx = {
-		.atomic_heartbeat = time(NULL),
+		.heartbeat = make_heartbeat(),
 		.avctx = ictx.avctx,
 		.buf = &buf
 	};
@@ -310,47 +395,22 @@ int main(int argc, const char **argv) {
 		error("Failed to start decoder thread\n");
 		goto fail;
 	}
-	thread_running = 1;
+	decoder_thread_running = 1;
 
 	for (;;) {
-		for (;;) {
-			err = av_read_frame(ictx.ic, packet);
-			if (err < 0) {
-				if (err == AVERROR(EAGAIN))
-					break;
-				error("Failed to read frame: %s\n", av_err2str(err));
-				goto fail;
-			}
-			else {
-				retry:
-				if (stop_now)
-					goto done;
-
-				if (check_decoder_ok(&decoder_ctx)) {
-					pthread_cancel(decoder);
-					goto fail;
-				}
-
-				pthread_mutex_lock(&buf.mutex);
-
-				if (buf.count == BUFSIZE) {
-					error("Packet buffer full\n");
-					pthread_mutex_unlock(&buf.mutex);
-					usleep(100 * 1000);
-					goto retry;
-				}
-				av_packet_move_ref(buf.pkts[buf.wpos], packet);
-				buf.wpos = (buf.wpos + 1) % BUFSIZE;
-				buf.count++;
-
-				info("Read pkt size %d wpos %d rpos %d count %d\n", buf.pkts[buf.wpos]->size, buf.wpos, buf.rpos, buf.count);
-
-				pthread_mutex_unlock(&buf.mutex);
-			}
+		if (check_heartbeat(&reader_ctx.heartbeat, "reader thread")) {
+			pthread_cancel(decoder);
+			goto fail;
 		}
+		if (check_heartbeat(&decoder_ctx.heartbeat, "decoder thread")) {
+			pthread_cancel(decoder);
+			goto fail;
+		}
+		if (stop_now || thread_exited) {
+			break;
+		}
+		usleep(100 * 1000);
 	}
-
-	done:
 
 	goto out;
 	fail:
@@ -358,11 +418,18 @@ int main(int argc, const char **argv) {
 	out:
 		stop_now = 1;
 		info("Main thread exiting\n");
-		if (thread_running) {
-			pthread_join(decoder, NULL);
-			info("Joined with decoder thread\n");
+		if (reader_thread_running) {
+			pthread_join(reader, &res);
+			info("Joined with reader thread\n");
+			if ((intptr_t) res)
+				ret = -1;
 		}
-		av_packet_free(&packet);
+		if (decoder_thread_running) {
+			pthread_join(decoder, &res);
+			info("Joined with decoder thread\n");
+			if ((intptr_t) res)
+				ret = -1;
+		}
 		pthread_mutex_lock(&buf.mutex);
 		for (int i = 0; i < BUFSIZE; i++)
 			av_packet_free(&buf.pkts[i]);
