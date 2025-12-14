@@ -1,5 +1,6 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -10,6 +11,7 @@
 #include <signal.h>
 
 static const char *url = "rtsp://localhost:8554/test";
+static const char *filename = "test_out.mp4";
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
@@ -45,6 +47,8 @@ static int open_input(InputContext *ictx, const char *filename) {
 	AVFormatContext *ic = NULL;
 	const AVInputFormat *file_iformat;
 	AVCodecContext *avctx;
+	AVStream *stream;
+	const AVCodec *codec;
 
 	file_iformat = av_find_input_format("rtsp");
 	if (!file_iformat) {
@@ -58,8 +62,6 @@ static int open_input(InputContext *ictx, const char *filename) {
 		goto out_fail;
 	}
 
-	ic->flags |= AVFMT_FLAG_NONBLOCK;
-
 	err = avformat_open_input(&ic, filename, file_iformat, NULL);
 	if (err < 0) {
 		error("Error opening input: %s\n", av_err2str(err));
@@ -70,7 +72,7 @@ static int open_input(InputContext *ictx, const char *filename) {
 	avctx = avcodec_alloc_context3(NULL);
 	if (!avctx) {
 		error("Could not allocate codec context\n");
-		goto out_free_codec_ctx;
+		goto out_free_format_ctx;
 	}
 
 	for (unsigned int i = 0; i < ic->nb_streams; i++) {
@@ -83,6 +85,34 @@ static int open_input(InputContext *ictx, const char *filename) {
 
 	av_dump_format(ic, 0, filename, 0);
 
+	stream = ic->streams[0];
+
+	err = avcodec_parameters_to_context(avctx, stream->codecpar);
+	if (err) {
+		error("Failed to set codec parameters: %s\n", av_err2str(err));
+		goto out_free_codec_ctx;
+	}
+
+	avctx->pkt_timebase = stream->time_base;
+		avctx->framerate = stream->r_frame_rate;
+
+	codec = avcodec_find_decoder(avctx->codec_id);
+	if (!codec) {
+		error("Input codec not found\n");
+		goto out_free_codec_ctx;
+	}
+
+	avctx->codec_id = codec->id;
+
+	if (avctx->codec_type != AVMEDIA_TYPE_VIDEO) {
+		error("Codec type was not video");
+		goto out_free_codec_ctx;
+	}
+
+	err = avcodec_open2(avctx, codec, NULL);
+	if (err < 0)
+		goto out_free_codec_ctx;
+
 	ictx->file_iformat = file_iformat;
 	ictx->ic = ic;
 	ictx->avctx = avctx;
@@ -90,6 +120,8 @@ static int open_input(InputContext *ictx, const char *filename) {
 	goto out;
 	out_free_codec_ctx:
 		avcodec_free_context(&avctx);
+	out_free_format_ctx:
+		avformat_free_context(ic);
 	out_fail:
 		ret = -1;
 	out:
@@ -100,6 +132,88 @@ static void close_input(InputContext *ictx) {
 	avformat_close_input(&ictx->ic);
 	assert(!ictx->ic);
 	avcodec_free_context(&ictx->avctx);
+}
+
+typedef struct OutputContext {
+	const AVOutputFormat *file_oformat;
+	AVFormatContext *oc;
+	AVCodecContext *avctx;
+} OutputContext;
+
+static int open_output(
+		OutputContext *octx,
+		const char *filename,
+		AVRational timebase,
+		AVRational framerate,
+		enum AVPixelFormat pixel_format,
+		int width,
+		int height
+) {
+	int err, ret = 0;
+
+	const AVOutputFormat *file_oformat;
+	AVFormatContext *oc = NULL;
+	AVCodecContext *avctx;
+	const AVCodec *codec;
+
+	info("Open output timebase %i/%i format %i\n", timebase.num, timebase.den, pixel_format);
+
+	file_oformat = av_guess_format("mp4", NULL, NULL);
+	if (!file_oformat) {
+		error("Failed to get output format\n");
+		goto out_fail;
+	}
+
+	err = avformat_alloc_output_context2(&oc, file_oformat, "mp4", filename);
+	if (err) {
+		error("Could not allocate output format context\n");
+		goto out_fail;
+	}
+
+	avctx = avcodec_alloc_context3(NULL);
+	if (!avctx) {
+		error("Could not allocate codec context\n");
+		goto out_free_format_ctx;
+	}
+
+	codec = avcodec_find_encoder_by_name("libx264");
+	if (!codec) {
+		error("Output codec not found\n");
+		goto out_free_codec_ctx;
+	}
+
+	avctx->codec_id = codec->id;
+	avctx->time_base = timebase;
+	avctx->framerate = framerate;
+	avctx->pix_fmt = pixel_format;
+	avctx->width = width;
+	avctx->height = height;
+
+	err = avcodec_open2(avctx, codec, NULL);
+	if (err < 0) {
+		error("Could not open output codec\n");
+		goto out_free_codec_ctx;
+	}
+
+	octx->file_oformat = file_oformat;
+	octx->oc = oc;
+	octx->avctx = avctx;
+
+	goto out;
+	out_free_codec_ctx:
+		avcodec_free_context(&avctx);
+	out_free_format_ctx:
+		avformat_free_context(oc);
+	out_fail:
+		ret = -1;
+	out:
+		return ret;
+}
+
+static void close_output(OutputContext *octx) {
+	if (octx->oc)
+		avformat_free_context(octx->oc);
+	octx->oc = NULL;
 }
 
 #define BUFSIZE 16
@@ -254,24 +368,46 @@ enum ThreadIndex {
 
 typedef struct EncoderContext {
 	FrameBuffer *buf;
+	AVRational timebase;
+	AVRational framerate;
 } EncoderContext;
 
 static int encoder_main(ThreadContext *thread, void *arg) {
-	int ret = 0;
+	int err, ret = 0;
+	OutputContext octx = {0};
 	EncoderContext *ctx = arg;
 	FrameBuffer *buf = ctx->buf;
+	AVFrame *frame = NULL;
+
+	frame = av_frame_alloc();
+	if (!frame) {
+		error("Failed to allocate frame\n");
+		goto fail;
+	}
 
 	for (;;) {
 		THREAD_WITH_BUF_READ(thread, buf, AVFrame,
+			av_frame_move_ref(frame, entry);
 			av_frame_unref(entry);
 			info("Read frame wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
 		);
+
+		if (!octx.oc) {
+			err = open_output(&octx, filename, ctx->timebase, frame->format, frame->width, frame->height);
+			if (err < 0)
+				goto fail;
+		}
+
+		av_frame_unref(frame);
+
 	}
 
 	goto done;
 	fail:
 		ret = 1;
 	done:
+		close_output(&octx);
+		av_frame_free(&frame);
 		thread_exited = 1;
 		return ret;
 }
@@ -422,8 +558,6 @@ int main(int argc, const char **argv) {
 	(void)(argv);
 
 	InputContext ictx = {0};
-	const AVCodec *codec;
-	AVStream *stream;
 	void *res;
 	PacketBuffer packet_buf = {0};
 	FrameBuffer frame_buf = {0};
@@ -447,33 +581,6 @@ int main(int argc, const char **argv) {
 	BUF_ALLOC(packet_buf, av_packet_alloc);
 	BUF_ALLOC(frame_buf, av_frame_alloc);
 
-	stream = ictx.ic->streams[0];
-
-	err = avcodec_parameters_to_context(ictx.avctx, stream->codecpar);
-	if (err) {
-		error("Failed to set codec parameters: %s\n", av_err2str(err));
-		goto fail;
-	}
-
-	ictx.avctx->pkt_timebase = stream->time_base;
-
-	codec = avcodec_find_decoder(ictx.avctx->codec_id);
-	if (!codec) {
-		error("Codec not found\n");
-		goto fail;
-	}
-
-	ictx.avctx->codec_id = codec->id;
-
-	if (ictx.avctx->codec_type != AVMEDIA_TYPE_VIDEO) {
-		error("Codec type was not video");
-		goto fail;
-	}
-
-	err = avcodec_open2(ictx.avctx, codec, NULL);
-	if (err < 0)
-		goto fail;
-
 	ReaderContext reader_ctx = {
 		.ic = ictx.ic,
 		.buf = &packet_buf
@@ -494,7 +601,9 @@ int main(int argc, const char **argv) {
 	threads[THREAD_DECODER].name = "decoder thread";
 
 	EncoderContext encoder_ctx = {
-		.buf = &frame_buf
+		.buf = &frame_buf,
+		.timebase = ictx.avctx->pkt_timebase,
+		.framerate = ictx.avctx->framerate
 	};
 
 	threads[THREAD_ENCODER].arg = &encoder_ctx;
