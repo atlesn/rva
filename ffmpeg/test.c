@@ -136,20 +136,52 @@ static Heartbeat make_heartbeat(void) {
 	return hb;
 }
 
+typedef struct ThreadContext ThreadContext;
+
+typedef int (*ThreadMain)(ThreadContext *, void *arg);
+
 typedef struct ThreadContext {
 	Heartbeat heartbeat;
 	pthread_t thread;
 	const char *name;
-	void *(*entry)(void *);
+	ThreadMain main;
 	int running;
 	void *arg;
 } ThreadContext;
 
+static void thread_heartbeat(ThreadContext *ctx) {
+	update_heartbeat(&ctx->heartbeat);
+}
+
+static void *thread_entry(void *arg) {
+	ThreadContext *ctx = arg;
+
+	int ret = ctx->main(ctx, ctx->arg);
+
+	return (void *)(intptr_t) ret;
+}
+
 enum ThreadIndex {
 	THREAD_READER,
 	THREAD_DECODER,
+	THREAD_ENCODER,
 	THREAD_COUNT
 };
+
+typedef struct EncoderContext {
+} EncoderContext;
+
+static int encoder_main(ThreadContext *thread, void *arg) {
+	int ret = 0;
+	EncoderContext *ctx = arg;
+
+	goto done;
+	fail:
+		ret = 1;
+	done:
+		thread_exited = 1;
+		return ret;
+}
 
 typedef struct DecoderContext {
 	enum AVCodecID codec_id;
@@ -157,10 +189,9 @@ typedef struct DecoderContext {
 	AVCodecContext *avctx;
 } DecoderContext;
 
-static void *decoder_main(void *arg) {
+static int decoder_main(ThreadContext *thread, void *arg) {
 	int err, ret = 0;
-	ThreadContext *thread = arg;
-	DecoderContext *ctx = thread->arg;
+	DecoderContext *ctx = arg;
 	PacketBuffer *buf = ctx->buf;
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
@@ -199,7 +230,7 @@ static void *decoder_main(void *arg) {
 		if (stop_now)
 			goto done;
 
-		update_heartbeat(&thread->heartbeat);
+		thread_heartbeat(thread);
 
 		err = avcodec_send_packet(ctx->avctx, packet);
 		if (err == AVERROR(EAGAIN)) {
@@ -234,7 +265,7 @@ static void *decoder_main(void *arg) {
 		av_packet_free(&packet);
 		av_frame_free(&frame);
 		thread_exited = 1;
-		return (void *) (intptr_t) ret;
+		return ret;
 }
 
 typedef struct ReaderContext {
@@ -242,10 +273,9 @@ typedef struct ReaderContext {
 	PacketBuffer *buf;
 } ReaderContext;
 
-static void *reader_main(void *arg) {
+static int reader_main(ThreadContext *thread, void *arg) {
 	int err, ret = 0;
-	ThreadContext *thread = arg;
-	ReaderContext *ctx = thread->arg;
+	ReaderContext *ctx = arg;
 	PacketBuffer *buf = ctx->buf;
 	AVPacket *packet = NULL;
 
@@ -269,7 +299,7 @@ static void *reader_main(void *arg) {
 				if (stop_now)
 					goto done;
 
-				update_heartbeat(&thread->heartbeat);
+				thread_heartbeat(thread);
 
 				pthread_mutex_lock(&buf->mutex);
 
@@ -297,7 +327,7 @@ static void *reader_main(void *arg) {
 		info("Reader thread exiting\n");
 		av_packet_free(&packet);
 		thread_exited = 1;
-		return (void *) (intptr_t) ret;
+		return ret;
 }
 
 static void signal_handler(int sig) {
@@ -393,7 +423,7 @@ int main(int argc, const char **argv) {
 	};
 
 	threads[THREAD_READER].arg = &reader_ctx;
-	threads[THREAD_READER].entry = reader_main;
+	threads[THREAD_READER].main = reader_main;
 	threads[THREAD_READER].name = "reader thread";
 
 	DecoderContext decoder_ctx = {
@@ -402,8 +432,16 @@ int main(int argc, const char **argv) {
 	};
 
 	threads[THREAD_DECODER].arg = &decoder_ctx;
-	threads[THREAD_DECODER].entry = decoder_main;
+	threads[THREAD_DECODER].main = decoder_main;
 	threads[THREAD_DECODER].name = "decoder thread";
+
+	EncoderContext encoder_ctx = {
+		0
+	};
+
+	threads[THREAD_ENCODER].arg = &encoder_ctx;
+	threads[THREAD_ENCODER].main = encoder_main;
+	threads[THREAD_ENCODER].name = "encoder thread";
 
 	for (int i = 0; i < THREAD_COUNT; i++) {
 		ThreadContext *thread = &threads[i];
@@ -412,7 +450,7 @@ int main(int argc, const char **argv) {
 
 		thread->heartbeat = make_heartbeat();
 
-		err = pthread_create(&thread->thread, NULL, thread->entry, thread);
+		err = pthread_create(&thread->thread, NULL, thread_entry, thread);
 		if (err) {
 			error("Failed to start %s\n", thread->name);
 			goto fail;
