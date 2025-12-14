@@ -73,7 +73,7 @@ static int open_input(InputContext *ictx, const char *filename) {
 		goto out_free_codec_ctx;
 	}
 
-	for (int i = 0; i < ic->nb_streams; i++) {
+	for (unsigned int i = 0; i < ic->nb_streams; i++) {
 		AVStream *stream = ic->streams[i];
 		info("stream[%d] codec id %d name %s tag %u\n",
 			i, stream->codecpar->codec_id, avcodec_get_name(stream->codecpar->codec_id), stream->codecpar->codec_tag);
@@ -104,13 +104,40 @@ static void close_input(InputContext *ictx) {
 
 #define BUFSIZE 16
 
-typedef struct PacketBuffer {
-	AVPacket *pkts[BUFSIZE];
-	pthread_mutex_t mutex;
-	int wpos;
-	int rpos;
+#define BUFMEMBERS(type)          \
+	type *entries[BUFSIZE];   \
+	pthread_mutex_t mutex;    \
+	int wpos;                 \
+	int rpos;                 \
 	int count;
+
+#define BUF_WRITE_BEGIN(buf, type) do {         \
+	type *entry = buf->entries[buf->wpos];
+
+#define BUF_WRITE_END(buf)                      \
+	buf->wpos = (buf->wpos + 1) % BUFSIZE;  \
+	buf->count++; } while(0)
+
+#define BUF_READ_BEGIN(buf, type) do {          \
+	type *entry = buf->entries[buf->rpos]
+
+#define BUF_READ_END(buf)                       \
+	buf->rpos = (buf->rpos + 1) % BUFSIZE;  \
+	buf->count--; } while(0)
+
+#define BUF_FULL(buf) \
+	buf->count == BUFSIZE
+
+#define BUF_EMPTY(buf) \
+	buf->count == 0
+
+typedef struct PacketBuffer {
+	BUFMEMBERS(AVPacket)
 } PacketBuffer;
+
+typedef struct FrameBuffer {
+	BUFMEMBERS(AVFrame)
+} FrameBuffer;
 
 typedef struct Heartbeat {
 	time_t atomic_heartbeat;
@@ -168,12 +195,45 @@ enum ThreadIndex {
 	THREAD_COUNT
 };
 
+#define THREAD_WITH_BUF_WRITE(thread, buf, type, task) \
+	retry:                                  \
+	if (stop_now) goto done;                \
+	thread_heartbeat(thread);               \
+	pthread_mutex_lock(&buf->mutex);        \
+	if (BUF_FULL(buf)) {                    \
+	  error("Buffer full");                 \
+	  pthread_mutex_unlock(&buf->mutex);    \
+	  usleep(100 * 1000);                   \
+	  goto retry;                           \
+	}                                       \
+	BUF_WRITE_BEGIN(buf, type);             \
+	task                                    \
+	BUF_WRITE_END(buf);                     \
+	pthread_mutex_unlock(&buf->mutex);
+
+#define THREAD_WITH_BUF_READ(thread, buf, type, task) \
+	retry:                                  \
+	if (stop_now) goto done;                \
+	thread_heartbeat(thread);               \
+	pthread_mutex_lock(&buf->mutex);        \
+	if (BUF_EMPTY(buf)) {                   \
+	  pthread_mutex_unlock(&buf->mutex);    \
+	  usleep(100 * 1000);                   \
+	  goto retry;                           \
+	}                                       \
+	BUF_READ_BEGIN(buf, type);              \
+	task                                    \
+	BUF_READ_END(buf);                      \
+	pthread_mutex_unlock(&buf->mutex);
+
 typedef struct EncoderContext {
 } EncoderContext;
 
 static int encoder_main(ThreadContext *thread, void *arg) {
 	int ret = 0;
 	EncoderContext *ctx = arg;
+
+	usleep(4 * 1000 * 1000);
 
 	goto done;
 	fail:
@@ -203,28 +263,15 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 	}
 
 	for (;;) {
-		if (stop_now)
-			goto done;
-
-		pthread_mutex_lock(&buf->mutex);
-		if (buf->count == 0) {
-			pthread_mutex_unlock(&buf->mutex);
-			usleep(10 * 1000);
-			continue;
-		}
-
-		packet = av_packet_alloc();
-		if (!packet) {
-			error("Failed to allocate packet\n");
-			goto fail;
-		}
-
-		av_packet_ref(packet, buf->pkts[buf->rpos]);
-		av_packet_unref(buf->pkts[buf->rpos]);
-		buf->rpos = (buf->rpos + 1) % BUFSIZE;
-		buf->count--;
-
-		pthread_mutex_unlock(&buf->mutex);
+		THREAD_WITH_BUF_READ(thread, buf, AVPacket,
+			packet = av_packet_alloc();
+			if (!packet) {
+				error("Failed to allocate packet\n");
+				goto fail;
+			}
+			av_packet_ref(packet, entry);
+			av_packet_unref(entry);
+		);
 
 		again:
 		if (stop_now)
@@ -295,27 +342,10 @@ static int reader_main(ThreadContext *thread, void *arg) {
 				goto fail;
 			}
 			else {
-				retry:
-				if (stop_now)
-					goto done;
-
-				thread_heartbeat(thread);
-
-				pthread_mutex_lock(&buf->mutex);
-
-				if (buf->count == BUFSIZE) {
-					error("Packet buffer full\n");
-					pthread_mutex_unlock(&buf->mutex);
-					usleep(100 * 1000);
-					goto retry;
-				}
-				av_packet_move_ref(buf->pkts[buf->wpos], packet);
-				buf->wpos = (buf->wpos + 1) % BUFSIZE;
-				buf->count++;
-
-				info("Read pkt size %d wpos %d rpos %d count %d\n", buf->pkts[buf->wpos]->size, buf->wpos, buf->rpos, buf->count);
-
-				pthread_mutex_unlock(&buf->mutex);
+				THREAD_WITH_BUF_WRITE(thread, buf, AVPacket,
+					av_packet_move_ref(entry, packet);
+					info("Read pkt size %d wpos %d rpos %d count %d\n", entry, buf->wpos, buf->rpos, buf->count);
+				);
 			}
 		}
 	}
@@ -354,6 +384,9 @@ static void signal_handler(int sig) {
 int main(int argc, const char **argv) {
 	int err, ret = 0;
 
+	(void)(argc);
+	(void)(argv);
+
 	InputContext ictx = {0};
 	const AVCodec *codec;
 	AVStream *stream;
@@ -383,8 +416,8 @@ int main(int argc, const char **argv) {
 		goto fail;
 
 	for (int i = 0; i < BUFSIZE; i++) {
-		buf.pkts[i] = av_packet_alloc();
-		if (!buf.pkts[i]) {
+		buf.entries[i] = av_packet_alloc();
+		if (!buf.entries[i]) {
 			error("Failed to allocate packet\n");
 			goto fail;
 		}
@@ -436,7 +469,6 @@ int main(int argc, const char **argv) {
 	threads[THREAD_DECODER].name = "decoder thread";
 
 	EncoderContext encoder_ctx = {
-		0
 	};
 
 	threads[THREAD_ENCODER].arg = &encoder_ctx;
@@ -492,7 +524,7 @@ int main(int argc, const char **argv) {
 		}
 		pthread_mutex_lock(&buf.mutex);
 		for (int i = 0; i < BUFSIZE; i++)
-			av_packet_free(&buf.pkts[i]);
+			av_packet_free(&buf.entries[i]);
 		pthread_mutex_unlock(&buf.mutex);
 		close_input(&ictx);
 		pthread_mutex_destroy(&buf.mutex);
