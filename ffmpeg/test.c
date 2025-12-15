@@ -35,10 +35,16 @@ static void info(const char *format, ...) {
 	va_end(args);
 }
 
+typedef struct SharedContext {
+	AVRational time_base;
+	AVCodecParameters *codecpar;
+} SharedContext;
+
 typedef struct InputContext {
 	const AVInputFormat *file_iformat;
 	AVFormatContext *ic;
 	AVCodecContext *avctx;
+	SharedContext *shctx;
 } InputContext;
 
 static int open_input(InputContext *ictx, const char *filename) {
@@ -94,7 +100,6 @@ static int open_input(InputContext *ictx, const char *filename) {
 	}
 
 	avctx->pkt_timebase = stream->time_base;
-		avctx->framerate = stream->r_frame_rate;
 
 	codec = avcodec_find_decoder(avctx->codec_id);
 	if (!codec) {
@@ -116,6 +121,8 @@ static int open_input(InputContext *ictx, const char *filename) {
 	ictx->file_iformat = file_iformat;
 	ictx->ic = ic;
 	ictx->avctx = avctx;
+	ictx->shctx->time_base = stream->time_base;
+	ictx->shctx->codecpar = stream->codecpar;
 
 	goto out;
 	out_free_codec_ctx:
@@ -143,8 +150,7 @@ typedef struct OutputContext {
 static int open_output(
 		OutputContext *octx,
 		const char *filename,
-		AVRational timebase,
-		AVRational framerate,
+		const SharedContext *shctx,
 		enum AVPixelFormat pixel_format,
 		int width,
 		int height
@@ -155,8 +161,9 @@ static int open_output(
 	AVFormatContext *oc = NULL;
 	AVCodecContext *avctx;
 	const AVCodec *codec;
+	AVDictionary *dict = NULL;
 
-	info("Open output timebase %i/%i format %i\n", timebase.num, timebase.den, pixel_format);
+	info("Open output timebase %i/%i format %i\n", shctx->time_base.num, shctx->time_base.den, pixel_format);
 
 	file_oformat = av_guess_format("mp4", NULL, NULL);
 	if (!file_oformat) {
@@ -176,23 +183,39 @@ static int open_output(
 		goto out_free_format_ctx;
 	}
 
-	codec = avcodec_find_encoder_by_name("libx264");
-	if (!codec) {
-		error("Output codec not found\n");
+	err = avcodec_parameters_to_context(avctx, shctx->codecpar);
+	if (err) {
+		error("Failed to set output codec parameters\n");
 		goto out_free_codec_ctx;
 	}
 
+	err = av_dict_set(&dict, "preset", "fast", 0);
+	if (!dict) {
+		error("Failed to create dictionary\n");
+		goto out_free_codec_ctx;
+	}
+
+	codec = avcodec_find_encoder_by_name("libx264");
+	if (!codec) {
+		error("Output codec not found\n");
+		goto out_free_dict;
+	}
+
 	avctx->codec_id = codec->id;
-	avctx->time_base = timebase;
-	avctx->framerate = framerate;
+	avctx->time_base = shctx->time_base;
 	avctx->pix_fmt = pixel_format;
 	avctx->width = width;
 	avctx->height = height;
+	avctx->qmin = 12;
+	avctx->qmax = 16;
+	avctx->max_qdiff = 2;
+	avctx->qcompress = 0.1;
+	avctx->bit_rate = 4 * 1000 * 1000;
 
-	err = avcodec_open2(avctx, codec, NULL);
+	err = avcodec_open2(avctx, codec, &dict);
 	if (err < 0) {
 		error("Could not open output codec\n");
-		goto out_free_codec_ctx;
+		goto out_free_dict;
 	}
 
 	octx->file_oformat = file_oformat;
@@ -200,6 +223,8 @@ static int open_output(
 	octx->avctx = avctx;
 
 	goto out;
+	out_free_dict:
+		av_dict_free(&dict);
 	out_free_codec_ctx:
 		avcodec_free_context(&avctx);
 	out_free_format_ctx:
@@ -213,6 +238,7 @@ static int open_output(
 static void close_output(OutputContext *octx) {
 	if (octx->oc)
 		avformat_free_context(octx->oc);
+	avcodec_free_context(&octx->avctx);
 	octx->oc = NULL;
 }
 
@@ -369,7 +395,7 @@ enum ThreadIndex {
 typedef struct EncoderContext {
 	FrameBuffer *buf;
 	AVRational timebase;
-	AVRational framerate;
+	SharedContext *shctx;
 } EncoderContext;
 
 static int encoder_main(ThreadContext *thread, void *arg) {
@@ -378,6 +404,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	EncoderContext *ctx = arg;
 	FrameBuffer *buf = ctx->buf;
 	AVFrame *frame = NULL;
+	AVPacket *packet = NULL;
 
 	frame = av_frame_alloc();
 	if (!frame) {
@@ -385,21 +412,45 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 		goto fail;
 	}
 
+	packet = av_packet_alloc();
+	if (!packet) {
+		error("Failed to allocate packet\n");
+		goto fail;
+	}
+
 	for (;;) {
 		THREAD_WITH_BUF_READ(thread, buf, AVFrame,
 			av_frame_move_ref(frame, entry);
 			av_frame_unref(entry);
-			info("Read frame wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
+			info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
 		);
 
 		if (!octx.oc) {
-			err = open_output(&octx, filename, ctx->timebase, frame->format, frame->width, frame->height);
+			err = open_output(&octx, filename, ctx->shctx, frame->format, frame->width, frame->height);
 			if (err < 0)
 				goto fail;
 		}
 
+		frame->pict_type = AV_PICTURE_TYPE_NONE;
+
+		err = avcodec_send_frame(octx.avctx, frame);
+		if (err) {
+			error("avcodec_send_frame failed: %s\n", av_err2str(err));
+			goto fail;
+		}
+
 		av_frame_unref(frame);
 
+		for (;;) {
+			err = avcodec_receive_packet(octx.avctx, packet);
+			if (err == AVERROR(EAGAIN)) {
+				break;
+			}
+			else if (err) {
+				error("avcodec_receive_packet failed: %s\n", av_err2str(err));
+				goto fail;
+			}
+		}
 	}
 
 	goto done;
@@ -408,6 +459,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	done:
 		close_output(&octx);
 		av_frame_free(&frame);
+		av_packet_free(&packet);
 		thread_exited = 1;
 		return ret;
 }
@@ -442,17 +494,10 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 			av_packet_unref(entry);
 		);
 
-		again:
-		if (stop_now)
-			goto done;
-
-		thread_heartbeat(thread);
-
 		err = avcodec_send_packet(ctx->avctx, packet);
-		if (err == AVERROR(EAGAIN)) {
-			error("avcodec_send_packet dropped packet\n");
-			usleep(100 * 1000);
-			goto again;
+		if (err) {
+			error("avcodec_send_packet dropped failed\n");
+			goto fail;
 		}
 		av_packet_free(&packet);
 
@@ -557,7 +602,10 @@ int main(int argc, const char **argv) {
 	(void)(argc);
 	(void)(argv);
 
-	InputContext ictx = {0};
+	SharedContext shctx = {0};
+	InputContext ictx = {
+		.shctx = &shctx
+	};
 	void *res;
 	PacketBuffer packet_buf = {0};
 	FrameBuffer frame_buf = {0};
@@ -603,7 +651,7 @@ int main(int argc, const char **argv) {
 	EncoderContext encoder_ctx = {
 		.buf = &frame_buf,
 		.timebase = ictx.avctx->pkt_timebase,
-		.framerate = ictx.avctx->framerate
+		.shctx = &shctx
 	};
 
 	threads[THREAD_ENCODER].arg = &encoder_ctx;
