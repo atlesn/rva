@@ -510,37 +510,37 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 	info("Finalizing output after %" PRIi64 " packets\n", packet_count);
 
-	if (packet_count) {
-		err = avcodec_send_frame(octx.avctx, NULL);
-		if (err) {
-			error("avcodec_send_frame failed when flushing: %s\n", av_err2str(err));
+	err = avcodec_send_frame(octx.avctx, NULL);
+	if (err) {
+		error("avcodec_send_frame failed when flushing: %s\n", av_err2str(err));
+		goto fail;
+	}
+
+	for (;;) {
+		err = avcodec_receive_packet(octx.avctx, packet);
+		if (err == AVERROR_EOF) {
+			break;
+		}
+		else if (err) {
+			error("avcodec_receive_packet failed when flushing: %s\n", av_err2str(err));
 			goto fail;
 		}
 
-		for (;;) {
-			err = avcodec_receive_packet(octx.avctx, packet);
-			if (err == AVERROR_EOF) {
-				break;
-			}
-			else if (err) {
-				error("avcodec_receive_packet failed when flushing: %s\n", av_err2str(err));
-				goto fail;
-			}
+		packet->stream_index = stream_index;
+		av_packet_rescale_ts(packet, octx.avctx->time_base, octx.oc->streams[stream_index]->time_base);
 
-			packet->stream_index = stream_index;
-			av_packet_rescale_ts(packet, octx.avctx->time_base, octx.oc->streams[stream_index]->time_base);
-
-			err = av_interleaved_write_frame(octx.oc, packet);
-			if (err) {
-				error("Failed to write packet while flushing: %s\n", strerror(errno));
-				goto fail;
-			}
-
-			packet_count++;
-
-			av_packet_unref(packet);
+		err = av_interleaved_write_frame(octx.oc, packet);
+		if (err) {
+			error("Failed to write packet while flushing: %s\n", strerror(errno));
+			goto fail;
 		}
+
+		packet_count++;
+
+		av_packet_unref(packet);
 	}
+
+	info("Packet count after finalizing: %" PRIi64 " packets\n", packet_count);
 
 	err = av_write_trailer(octx.oc);
 	if (err) {
