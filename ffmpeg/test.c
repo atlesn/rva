@@ -38,7 +38,6 @@ static void info(const char *format, ...) {
 
 typedef struct SharedContext {
 	AVRational time_base;
-	AVCodecParameters *codecpar;
 	int encoder_flushed;
 } SharedContext;
 
@@ -124,7 +123,6 @@ static int open_input(InputContext *ictx, const char *filename) {
 	ictx->ic = ic;
 	ictx->avctx = avctx;
 	ictx->shctx->time_base = stream->time_base;
-	ictx->shctx->codecpar = stream->codecpar;
 
 	goto out;
 	out_free_codec_ctx:
@@ -147,7 +145,6 @@ typedef struct EncoderPrivateContext {
 	const AVOutputFormat *file_oformat;
 	AVFormatContext *oc;
 	AVCodecContext *avctx;
-	int fd;
 } EncoderPrivateContext;
 
 static int open_encoder(
@@ -164,9 +161,8 @@ static int open_encoder(
 	AVFormatContext *oc = NULL;
 	AVCodecContext *avctx;
 	const AVCodec *codec;
-	AVDictionary *dict = NULL;
-	int fd = 0;
 	char cwd[PATH_MAX] = {0};
+	AVStream *stream;
 
 	getcwd(cwd, sizeof(cwd));
 	info("CWD: %s\n", cwd);
@@ -182,48 +178,36 @@ static int open_encoder(
 		goto out_fail;
 	}
 
-	fd = open(filename, O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
-	if (fd < 0) {
-		error("Failed to open %s for writing: %s\n", filename, strerror(errno));
-		goto out_fail;
-	}
-
 	file_oformat = av_guess_format("mp4", NULL, NULL);
 	if (!file_oformat) {
 		error("Failed to get output format\n");
-		goto out_close;
+		goto out_fail;
 	}
 
 	err = avformat_alloc_output_context2(&oc, file_oformat, "mp4", filename);
 	if (err) {
 		error("Could not allocate output format context\n");
-		goto out_close;
-	}
-
-	avctx = avcodec_alloc_context3(NULL);
-	if (!avctx) {
-		error("Could not allocate codec context\n");
-		goto out_free_format_ctx;
-	}
-
-	err = avcodec_parameters_to_context(avctx, shctx->codecpar);
-	if (err) {
-		error("Failed to set output codec parameters\n");
-		goto out_free_codec_ctx;
-	}
-
-	err = av_dict_set(&dict, "preset", "fast", 0);
-	if (!dict) {
-		error("Failed to create dictionary\n");
-		goto out_free_codec_ctx;
+		goto out_fail;
 	}
 
 	codec = avcodec_find_encoder_by_name("libx264");
 	if (!codec) {
 		error("Output codec not found\n");
-		goto out_free_dict;
+		goto out_free_format_ctx;
 	}
 
+	stream = avformat_new_stream(oc, NULL);
+	if (!stream) {
+		error("Failed to create output stream\n");
+		goto out_free_format_ctx;
+	}
+
+	avctx = avcodec_alloc_context3(codec);
+	if (!avctx) {
+		error("Could not allocate output codec context\n");
+		goto out_free_format_ctx;
+	}
+	
 	avctx->codec_id = codec->id;
 	avctx->time_base = shctx->time_base;
 	avctx->pix_fmt = pixel_format;
@@ -235,39 +219,64 @@ static int open_encoder(
 	avctx->qcompress = 0.1;
 	avctx->bit_rate = 4 * 1000 * 1000;
 
-	err = avcodec_open2(avctx, codec, &dict);
-	if (err < 0) {
-		error("Could not open output codec\n");
-		goto out_free_dict;
+	err = avcodec_parameters_from_context(stream->codecpar, avctx);
+	if (err) {
+		error("Failed to set parameters on stream\n");
+		goto out_free_format_ctx;
+	}
+
+	err = avcodec_open2(avctx, codec, NULL);
+	if (err) {
+		error("Failed to open output codec\n");
+		goto out_free_format_ctx;
+	}
+
+	stream->time_base = avctx->time_base;
+
+	av_dump_format(oc, 0, filename, 1);
+
+	err = avio_open(&oc->pb, filename, AVIO_FLAG_WRITE);
+	if (err) {
+		error("Failed to open output file '%s': %s\n", filename, av_err2str(err));
+		goto out_free_codec_ctx;
+	}
+
+	// err = av_dict_set(&dict, "preset", "fast", 0);
+	// if (!dict) {
+	//	error("Failed to create dictionary\n");
+	//	goto out_free_codec_ctx;
+	// }
+
+	err = avformat_write_header(oc, NULL);
+	if (err) {
+		error("Failed to write file header: %s\n", av_err2str(err));
+		goto out_close_avio;
 	}
 
 	octx->file_oformat = file_oformat;
 	octx->oc = oc;
 	octx->avctx = avctx;
-	octx->fd = fd;
 
 	goto out;
-	out_free_dict:
-		av_dict_free(&dict);
+	out_close_avio:
+		avio_closep(&oc->pb);
 	out_free_codec_ctx:
 		avcodec_free_context(&avctx);
 	out_free_format_ctx:
 		avformat_free_context(oc);
-	out_close:
-		close(fd);
 	out_fail:
 		ret = -1;
 	out:
 		return ret;
 }
 
-static void close_output(EncoderPrivateContext *octx) {
-	if (octx->oc)
+static void close_encoder(EncoderPrivateContext *octx) {
+	if (octx->oc) {
+		avio_closep(&octx->oc->pb);
 		avformat_free_context(octx->oc);
+		octx->oc = NULL;
+	}
 	avcodec_free_context(&octx->avctx);
-	if (octx->fd)
-		close(octx->fd);
-	octx->oc = NULL;
 }
 
 #define BUFSIZE 16
@@ -382,7 +391,6 @@ enum ThreadIndex {
 	THREAD_READER,
 	THREAD_DECODER,
 	THREAD_ENCODER,
-	THREAD_WRITER,
 	THREAD_COUNT
 };
 
@@ -421,58 +429,8 @@ enum ThreadIndex {
 	BUF_READ_END(buf);                      \
 	pthread_mutex_unlock(&buf->mutex);
 
-typedef struct OutputContext {
-} OutputContext;
-
-static int open_output(OutputContext *octx) {
-	int err, ret = 0;
-
-	AVFormatContext *ic = NULL;
-	AVOutputFormat *file_oformat;
-
-	ic = avformat_alloc_output_context2(&ic, NULL, NULL, octx->filename);
-	if (!ic) {
-		error("Could not allocate output format context\n");
-		goto out_fail;
-	}
-
-	// TODO:  Create  stream
-
-	err = avformat_open(&ic, filename, file_oformat, NULL);
-	if (err < 0) {
-		error("Error opening input: %s\n", av_err2str(err));
-		assert(!ic);
-		goto out_free_format_ctx;
-	}
-
-	goto out;
-	out_free_format_ctx:
-		avformat_free_context(ic);
-	out_fail:
-		ret = 1;
-	out:
-		return ret;
-}
-
-typedef struct WriterContext {
-	PacketBuffer *packet_buf;
-	SharedContext *shctx;
-} WriterContext;
-
-static int writer_main(ThreadContext *thread, void *arg) {
-	int err, ret = 0;
-	WriterContext *ctx = arg;
-
-	av_format_
-
-	goto out;
-	out:
-		return ret;
-}
-
 typedef struct EncoderContext {
 	FrameBuffer *frame_buf;
-	PacketBuffer *packet_buf;
 	AVRational timebase;
 	SharedContext *shctx;
 } EncoderContext;
@@ -485,6 +443,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
 	int64_t packet_count = 0;
+	unsigned int stream_index = 0;
 
 	frame = av_frame_alloc();
 	if (!frame) {
@@ -499,6 +458,8 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	}
 
 	for (;;) {
+		info("Write packet count %" PRIi64 "\n", packet_count);
+
 		THREAD_WITH_BUF_READ(thread, buf, AVFrame,
 			av_frame_move_ref(frame, entry);
 			av_frame_unref(entry);
@@ -533,15 +494,21 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 			info("Read packet from encoder pts %lli dts %lli\n", (long long int) packet->pts, (long long int) packet->dts);
 
-			THREAD_WITH_BUF_WRITE(thread, ctx->packet_buf, AVPacket,
-				av_packet_move_ref(entry, packet);
-			);
+			err = av_interleaved_write_frame(octx.oc, packet);
+			if (err) {
+				error("Failed to write packet: %s\n", strerror(errno));
+				goto fail;
+			}
 
 			packet_count++;
 
 			av_packet_unref(packet);
 		}
 	}
+
+	done:
+
+	info("Finalizing output after %" PRIi64 " packets\n", packet_count);
 
 	if (packet_count) {
 		err = avcodec_send_frame(octx.avctx, NULL);
@@ -552,7 +519,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 		for (;;) {
 			err = avcodec_receive_packet(octx.avctx, packet);
-			if (err == AVERROR(EOF)) {
+			if (err == AVERROR_EOF) {
 				break;
 			}
 			else if (err) {
@@ -560,15 +527,14 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 				goto fail;
 			}
 
-			err = write(octx.fd, packet->data, packet->size);
-			if (err != packet->size) {
+			packet->stream_index = stream_index;
+			av_packet_rescale_ts(packet, octx.avctx->time_base, octx.oc->streams[stream_index]->time_base);
+
+			err = av_interleaved_write_frame(octx.oc, packet);
+			if (err) {
 				error("Failed to write packet while flushing: %s\n", strerror(errno));
 				goto fail;
 			}
-
-			THREAD_WITH_BUF_WRITE(thread, ctx->packet_buf, AVPacket,
-				av_packet_move_ref(entry, packet);
-			);
 
 			packet_count++;
 
@@ -576,13 +542,20 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 		}
 	}
 
+	err = av_write_trailer(octx.oc);
+	if (err) {
+		error("Failed to write trailer\n");
+		goto fail;
+	}
+
 	ctx->shctx->encoder_flushed = 1;
 
-	goto done;
+	goto out;
 	fail:
 		ret = 1;
-	done:
-		close_output(&octx);
+	out:
+		info("Encoder thread exiting\n");
+		close_encoder(&octx);
 		av_frame_free(&frame);
 		av_packet_free(&packet);
 		thread_exited = 1;
@@ -733,7 +706,6 @@ int main(int argc, const char **argv) {
 	};
 	void *res;
 	PacketBuffer input_packet_buf = {0};
-	PacketBuffer output_packet_buf = {0};
 	FrameBuffer frame_buf = {0};
 	ThreadContext threads[THREAD_COUNT];
 
@@ -752,7 +724,6 @@ int main(int argc, const char **argv) {
 	if (err < 0)
 		goto fail;
 
-	BUF_ALLOC(output_packet_buf, av_packet_alloc);
 	BUF_ALLOC(input_packet_buf, av_packet_alloc);
 	BUF_ALLOC(frame_buf, av_frame_alloc);
 
@@ -777,7 +748,6 @@ int main(int argc, const char **argv) {
 
 	EncoderContext encoder_ctx = {
 		.frame_buf = &frame_buf,
-		.packet_buf = &output_packet_buf,
 		.timebase = ictx.avctx->pkt_timebase,
 		.shctx = &shctx
 	};
@@ -785,15 +755,6 @@ int main(int argc, const char **argv) {
 	threads[THREAD_ENCODER].arg = &encoder_ctx;
 	threads[THREAD_ENCODER].main = encoder_main;
 	threads[THREAD_ENCODER].name = "encoder thread";
-
-	WriterContext writer_ctx = {
-		.packet_buf = &output_packet_buf,
-		.shctx = &shctx
-	};
-
-	threads[THREAD_WRITER].arg = &writer_ctx;
-	threads[THREAD_WRITER].main = writer_main;
-	threads[THREAD_WRITER].name = "writer thread";
 
 	for (int i = 0; i < THREAD_COUNT; i++) {
 		ThreadContext *thread = &threads[i];
@@ -844,7 +805,6 @@ int main(int argc, const char **argv) {
 		}
 		BUF_FREE(frame_buf, AVFrame, av_frame_free);
 		BUF_FREE(input_packet_buf, AVPacket, av_packet_free);
-		BUF_FREE(output_packet_buf, AVPacket, av_packet_free);
 		close_input(&ictx);
 		return ret;
 }
