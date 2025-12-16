@@ -430,6 +430,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	EncoderState state = 0;
 	uint8_t filename_index = 0;
 	char filename_indexed[PATH_MAX];
+	double elapsed_s = 0.0f;
 
 	frame = av_frame_alloc();
 	if (!frame) {
@@ -446,8 +447,6 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	encode:
 
 	for (;;) {
-		info("Write packet count %" PRIi64 "\n", packet_count);
-
 		if (flush_now) {
 			flush_now = 0;
 			goto done;
@@ -464,11 +463,12 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 			THREAD_WITH_BUF_READ(thread, buf, AVFrame,
 				av_frame_move_ref(frame, entry);
 				av_frame_unref(entry);
-				info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
+				// info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
 			);
 
 			if (!octx.oc) {
 				sprintf(filename_indexed, "%s%04u%s", filename_prefix, filename_index, filename_suffix);
+				info("Using output file %s\n", filename_indexed);
 				filename_index++;
 				err = open_encoder(&octx, filename_indexed, ctx->shctx, frame->format, frame->width, frame->height);
 				if (err)
@@ -500,6 +500,8 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 				state |= ENCODER_STATE_RUN;
 			}
 
+			elapsed_s = (double) frame->pts * ((double) octx.avctx->time_base.num / (double) octx.avctx->time_base.den);
+
 			frame->pict_type = AV_PICTURE_TYPE_NONE;
 
 			err = avcodec_send_frame(octx.avctx, frame);
@@ -524,7 +526,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 				goto fail;
 			}
 
-			info("Read packet from encoder pts %lli dts %lli\n", (long long int) packet->pts, (long long int) packet->dts);
+			// info("Read packet from encoder pts %lli dts %lli\n", (long long int) packet->pts, (long long int) packet->dts);
 
 			err = av_interleaved_write_frame(octx.oc, packet);
 			if (err) {
@@ -548,7 +550,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 	write_trailer:
 
-	info("Packet count after finalizing: %" PRIi64 " packets\n", packet_count);
+	info("Packet count after finalizing is %" PRIi64 " packets and elapsed time is %0.2lf" "s\n", packet_count, elapsed_s);
 
 	err = av_write_trailer(octx.oc);
 	if (err) {
@@ -669,7 +671,7 @@ static int reader_main(ThreadContext *thread, void *arg) {
 			else {
 				THREAD_WITH_BUF_WRITE(thread, buf, AVPacket,
 					av_packet_move_ref(entry, packet);
-					info("Read pkt size %d wpos %d rpos %d count %d\n", entry->size, buf->wpos, buf->rpos, buf->count);
+					// info("Read pkt size %d wpos %d rpos %d count %d\n", entry->size, buf->wpos, buf->rpos, buf->count);
 				);
 			}
 		}
