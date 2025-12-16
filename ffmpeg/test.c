@@ -72,7 +72,7 @@ static int open_input(InputContext *ictx, const char *url) {
 	}
 
 	err = avformat_open_input(&ic, url, file_iformat, NULL);
-	if (err < 0) {
+	if (err) {
 		error("Error opening input: %s\n", av_err2str(err));
 		assert(!ic);
 		goto out_free_format_ctx;
@@ -118,7 +118,7 @@ static int open_input(InputContext *ictx, const char *url) {
 	}
 
 	err = avcodec_open2(avctx, codec, NULL);
-	if (err < 0)
+	if (err)
 		goto out_free_codec_ctx;
 
 	ictx->file_iformat = file_iformat;
@@ -132,7 +132,7 @@ static int open_input(InputContext *ictx, const char *url) {
 	out_free_format_ctx:
 		avformat_free_context(ic);
 	out_fail:
-		ret = -1;
+		ret = 1;
 	out:
 		return ret;
 }
@@ -239,12 +239,12 @@ static int open_encoder(
 	octx->avctx = avctx;
 
 	goto out;
-	out_free_codec_ctx:
-		avcodec_free_context(&avctx);
+//	out_free_codec_ctx:
+//		avcodec_free_context(&avctx);
 	out_free_format_ctx:
 		avformat_free_context(oc);
 	out_fail:
-		ret = -1;
+		ret = 1;
 	out:
 		return ret;
 }
@@ -427,7 +427,6 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
 	int64_t packet_count = 0;
-	unsigned int stream_index = 0;
 	EncoderState state = 0;
 	uint8_t filename_index = 0;
 	char filename_indexed[PATH_MAX];
@@ -472,7 +471,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 				sprintf(filename_indexed, "%s%04u%s", filename_prefix, filename_index, filename_suffix);
 				filename_index++;
 				err = open_encoder(&octx, filename_indexed, ctx->shctx, frame->format, frame->width, frame->height);
-				if (err < 0)
+				if (err)
 					goto fail;
 			}
 
@@ -546,31 +545,7 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	info("Finalizing output after %" PRIi64 " packets\n", packet_count);
 
 	goto encode;
-/*
-	for (;;) {
-		err = avcodec_receive_packet(octx.avctx, packet);
-		if (err == AVERROR_EOF) {
-			break;
-		}
-		else if (err) {
-			error("avcodec_receive_packet failed when flushing: %s\n", av_err2str(err));
-			goto fail;
-		}
 
-		packet->stream_index = stream_index;
-		av_packet_rescale_ts(packet, octx.avctx->time_base, octx.oc->streams[stream_index]->time_base);
-
-		err = av_interleaved_write_frame(octx.oc, packet);
-		if (err) {
-			error("Failed to write packet while flushing: %s\n", strerror(errno));
-			goto fail;
-		}
-
-		packet_count++;
-
-		av_packet_unref(packet);
-	}
-*/
 	write_trailer:
 
 	info("Packet count after finalizing: %" PRIi64 " packets\n", packet_count);
@@ -685,7 +660,7 @@ static int reader_main(ThreadContext *thread, void *arg) {
 	for (;;) {
 		for (;;) {
 			err = av_read_frame(ctx->ic, packet);
-			if (err < 0) {
+			if (err) {
 				if (err == AVERROR(EAGAIN))
 					break;
 				error("Failed to read frame: %s\n", av_err2str(err));
@@ -766,7 +741,7 @@ int main(int argc, const char **argv) {
 	}
 
 	err = open_input(&ictx, url);
-	if (err < 0)
+	if (err)
 		goto fail;
 
 	BUF_ALLOC(input_packet_buf, av_packet_alloc);
