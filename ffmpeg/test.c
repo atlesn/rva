@@ -15,6 +15,8 @@ static const char *url = "rtsp://localhost:8554/test";
 static const char *filename_prefix = "./test_out-";
 static const char *filename_suffix = ".mp4";
 static const int HEARTBEAT_TIMEOUT_S = 600;
+static const int WIDTH = 1920;
+static const int HEIGHT = 1080;
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
@@ -144,7 +146,6 @@ static void close_input(InputContext *ictx) {
 }
 
 typedef struct EncoderPrivateContext {
-	const AVOutputFormat *file_oformat;
 	AVFormatContext *oc;
 	AVCodecContext *avctx;
 } EncoderPrivateContext;
@@ -234,7 +235,6 @@ static int open_encoder(
 	//	goto out_free_codec_ctx;
 	// }
 
-	octx->file_oformat = file_oformat;
 	octx->oc = oc;
 	octx->avctx = avctx;
 
