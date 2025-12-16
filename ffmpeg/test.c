@@ -1,6 +1,9 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -14,9 +17,8 @@
 static const char *url = "rtsp://localhost:8554/test";
 static const char *filename_prefix = "./test_out-";
 static const char *filename_suffix = ".mp4";
+static const char *filterdescr = "scale=1920:1080";
 static const int HEARTBEAT_TIMEOUT_S = 600;
-static const int WIDTH = 1920;
-static const int HEIGHT = 1080;
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
@@ -45,6 +47,111 @@ typedef struct SharedContext {
 	AVRational time_base;
 } SharedContext;
 
+typedef struct FilterContext {
+	AVFilterGraph *filter_graph;
+	AVFilterContext *buffersrc_ctx;
+	AVFilterContext *buffersink_ctx;
+} FilterContext;
+
+static int open_filter(
+		FilterContext *fctx,
+		const char *filterdescr,
+		int width,
+		int height,
+		int pixel_format,
+		AVRational time_base,
+		AVRational sample_aspect_ratio
+) {
+	int err, ret = 0;
+
+	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
+	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+	AVFilterInOut *inputs = NULL;
+	AVFilterInOut *outputs = NULL;
+	AVFilterGraph *filter_graph = NULL;
+	AVFilterContext *buffersrc_ctx = NULL;
+	AVFilterContext *buffersink_ctx = NULL;
+	char args[512];
+
+	outputs = avfilter_inout_alloc();
+	inputs = avfilter_inout_alloc();
+	filter_graph = avfilter_graph_alloc();
+
+	if (!outputs || !inputs || !filter_graph) {
+		error("Allocation of filters failed\n");
+		goto fail;
+	}
+
+	sprintf(args, "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+		width, height, pixel_format, time_base.num, time_base.den, sample_aspect_ratio.num, sample_aspect_ratio.den);
+
+	err = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args, NULL, filter_graph);
+	if (err) {
+		error("Failed to create filter buffer source context\n");
+		goto fail;
+	}
+
+	buffersink_ctx = avfilter_graph_alloc_filter(filter_graph, buffersink, "out");
+	if (!buffersink_ctx) {
+		error("Failed to create filter buffer sink context\n");
+		goto fail;
+	}
+
+	err = avfilter_init_dict(buffersink_ctx, NULL);
+	if (err) {
+		error("Failed to initialize buffer sink context\n");
+		goto fail;
+	}
+
+	outputs->name       = av_strdup("in");
+	outputs->filter_ctx = buffersrc_ctx;
+	outputs->pad_idx    = 0;
+	outputs->next       = NULL;
+
+	inputs->name        = av_strdup("out");
+	inputs->filter_ctx  = buffersink_ctx;
+	inputs->pad_idx     = 0;
+	inputs->next        = NULL;
+
+	err = avfilter_graph_parse_ptr(filter_graph, filterdescr, &inputs, &outputs, NULL);
+
+	fctx->buffersrc_ctx = buffersrc_ctx;
+	fctx->buffersink_ctx = buffersink_ctx;
+
+	buffersrc_ctx = NULL;
+	buffersink_ctx = NULL;
+	inputs = NULL;
+	outputs = NULL;
+
+	if (err) {
+		error("Failed to parse graph filter description\n");
+		goto fail;
+	}
+
+	err = avfilter_graph_config(filter_graph, NULL);
+	if (err) {
+		error("Failed to configure filter graph");
+		goto fail;
+	}
+
+	fctx->filter_graph = filter_graph;
+
+	goto out;
+	fail:
+		avfilter_free(buffersink_ctx);
+		avfilter_free(buffersrc_ctx);
+		avfilter_graph_free(&filter_graph);
+		avfilter_inout_free(&outputs);
+		avfilter_inout_free(&inputs);
+		ret = 1;
+	out:
+		return ret;
+}
+
+static void close_filter(FilterContext *fctx) {
+	avfilter_graph_free(&fctx->filter_graph);
+}
+
 typedef struct InputContext {
 	const AVInputFormat *file_iformat;
 	AVFormatContext *ic;
@@ -60,6 +167,7 @@ static int open_input(InputContext *ictx, const char *url) {
 	AVCodecContext *avctx;
 	AVStream *stream;
 	const AVCodec *codec;
+	int stream_index;
 
 	file_iformat = av_find_input_format("rtsp");
 	if (!file_iformat) {
@@ -80,9 +188,9 @@ static int open_input(InputContext *ictx, const char *url) {
 		goto out_free_format_ctx;
 	}
 
-	avctx = avcodec_alloc_context3(NULL);
-	if (!avctx) {
-		error("Could not allocate codec context\n");
+	err = avformat_find_stream_info(ic, NULL);
+	if (err) {
+		error("Could not find stream information");
 		goto out_free_format_ctx;
 	}
 
@@ -92,11 +200,21 @@ static int open_input(InputContext *ictx, const char *url) {
 			i, stream->codecpar->codec_id, avcodec_get_name(stream->codecpar->codec_id), stream->codecpar->codec_tag);
 	}
 
-	assert(ic->nb_streams > 0);
+	err = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+	if (err < 0) {
+		error("Could not find best stream\n");
+		goto out_free_format_ctx;
+	}
+	stream_index = err;
+	stream = ic->streams[stream_index];
+
+	avctx = avcodec_alloc_context3(NULL);
+	if (!avctx) {
+		error("Could not allocate codec context\n");
+		goto out_free_format_ctx;
+	}
 
 	av_dump_format(ic, 0, url, 0);
-
-	stream = ic->streams[0];
 
 	err = avcodec_parameters_to_context(avctx, stream->codecpar);
 	if (err) {
@@ -104,24 +222,12 @@ static int open_input(InputContext *ictx, const char *url) {
 		goto out_free_codec_ctx;
 	}
 
-	avctx->pkt_timebase = stream->time_base;
-
-	codec = avcodec_find_decoder(avctx->codec_id);
-	if (!codec) {
-		error("Input codec not found\n");
-		goto out_free_codec_ctx;
-	}
-
-	avctx->codec_id = codec->id;
-
-	if (avctx->codec_type != AVMEDIA_TYPE_VIDEO) {
-		error("Codec type was not video");
-		goto out_free_codec_ctx;
-	}
-
 	err = avcodec_open2(avctx, codec, NULL);
 	if (err)
 		goto out_free_codec_ctx;
+
+	avctx->pkt_timebase = stream->time_base;
+	assert(avctx->codec_type == AVMEDIA_TYPE_VIDEO);
 
 	ictx->file_iformat = file_iformat;
 	ictx->ic = ic;
@@ -201,7 +307,7 @@ static int open_encoder(
 		error("Could not allocate output codec context\n");
 		goto out_free_format_ctx;
 	}
-	
+
 	avctx->codec_id = codec->id;
 	avctx->time_base = shctx->time_base;
 	avctx->pix_fmt = pixel_format;
@@ -542,6 +648,10 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 	done:
 
+	if (stop_now && !octx.oc) {
+		goto out;
+	}
+
 	state |= ENCODER_STATE_FLUSH;
 
 	info("Finalizing output after %" PRIi64 " packets\n", packet_count);
@@ -586,7 +696,8 @@ typedef struct DecoderContext {
 static int decoder_main(ThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	DecoderContext *ctx = arg;
-	AVFrame *frame = NULL;
+	FilterContext fctx = {0};
+	AVFrame *frame = NULL, *filt_frame = NULL;
 	AVPacket *packet = NULL;
 
 	frame = av_frame_alloc();
@@ -594,6 +705,18 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 		error("Failed to allocate frame\n");
 		goto fail;
 	}
+
+	filt_frame = av_frame_alloc();
+	if (!filt_frame) {
+		error("Failed to allocate frame\n");
+		goto fail;
+	}
+
+	err = open_filter(&fctx, filterdescr,
+		ctx->avctx->width, ctx->avctx->height,
+		ctx->avctx->pix_fmt, ctx->avctx->pkt_timebase, ctx->avctx->sample_aspect_ratio);
+	if (err)
+		goto fail;
 
 	for (;;) {
 		THREAD_WITH_BUF_READ(thread, ctx->packet_buf, AVPacket,
@@ -620,9 +743,25 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 				break;
 			}
 			else if (err >= 0) {
-				THREAD_WITH_BUF_WRITE(thread, ctx->frame_buf, AVFrame,
-					av_frame_move_ref(entry, frame);
-				);
+				err = av_buffersrc_add_frame_flags(fctx.buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+				if (err) {
+					error("Failed to add frame to filter graph\n");
+					goto fail;
+				}
+
+				for (;;) {
+					err = av_buffersink_get_frame(fctx.buffersink_ctx, filt_frame);
+					if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
+						break;
+					}
+					else if (err < 0) {
+						error("Failed to get frame from filter graph\n");
+						goto fail;
+					}
+					THREAD_WITH_BUF_WRITE(thread, ctx->frame_buf, AVFrame,
+						av_frame_move_ref(entry, filt_frame);
+					);
+				}
 			}
 			else {
 				error("avcodec_receive_frame failed: %s\n", av_err2str(err));
@@ -636,7 +775,9 @@ static int decoder_main(ThreadContext *thread, void *arg) {
 		ret = 1;
 	done:
 		info("Decoder thread exiting\n");
+		close_filter(&fctx);
 		av_packet_free(&packet);
+		av_frame_free(&filt_frame);
 		av_frame_free(&frame);
 		thread_exited = 1;
 		return ret;
