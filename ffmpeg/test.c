@@ -12,10 +12,13 @@
 #include <fcntl.h>
 
 static const char *url = "rtsp://localhost:8554/test";
-static const char *filename = "./test_out.mp4";
+static const char *filename_prefix = "./test_out-";
+static const char *filename_suffix = ".mp4";
+static const int HEARTBEAT_TIMEOUT_S = 600;
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
+static volatile int flush_now = 0;
 static volatile int thread_exited = 0;
 
 static void error(const char *format, ...) {
@@ -38,7 +41,6 @@ static void info(const char *format, ...) {
 
 typedef struct SharedContext {
 	AVRational time_base;
-	int encoder_flushed;
 } SharedContext;
 
 typedef struct InputContext {
@@ -48,7 +50,7 @@ typedef struct InputContext {
 	SharedContext *shctx;
 } InputContext;
 
-static int open_input(InputContext *ictx, const char *filename) {
+static int open_input(InputContext *ictx, const char *url) {
 	int err, ret = 0;
 
 	AVFormatContext *ic = NULL;
@@ -69,7 +71,7 @@ static int open_input(InputContext *ictx, const char *filename) {
 		goto out_free_format_ctx;
 	}
 
-	err = avformat_open_input(&ic, filename, file_iformat, NULL);
+	err = avformat_open_input(&ic, url, file_iformat, NULL);
 	if (err < 0) {
 		error("Error opening input: %s\n", av_err2str(err));
 		assert(!ic);
@@ -90,7 +92,7 @@ static int open_input(InputContext *ictx, const char *filename) {
 
 	assert(ic->nb_streams > 0);
 
-	av_dump_format(ic, 0, filename, 0);
+	av_dump_format(ic, 0, url, 0);
 
 	stream = ic->streams[0];
 
@@ -169,15 +171,6 @@ static int open_encoder(
 
 	info("Open output timebase %i/%i format %i\n", shctx->time_base.num, shctx->time_base.den, pixel_format);
 
-	err = unlink(filename);
-	if (!err || (err && errno == ENOENT)) {
-		// OK
-	}
-	else {
-		error("Failed to unlink %s: %s\n", filename, strerror(errno));
-		goto out_fail;
-	}
-
 	file_oformat = av_guess_format("mp4", NULL, NULL);
 	if (!file_oformat) {
 		error("Failed to get output format\n");
@@ -235,31 +228,17 @@ static int open_encoder(
 
 	av_dump_format(oc, 0, filename, 1);
 
-	err = avio_open(&oc->pb, filename, AVIO_FLAG_WRITE);
-	if (err) {
-		error("Failed to open output file '%s': %s\n", filename, av_err2str(err));
-		goto out_free_codec_ctx;
-	}
-
 	// err = av_dict_set(&dict, "preset", "fast", 0);
 	// if (!dict) {
 	//	error("Failed to create dictionary\n");
 	//	goto out_free_codec_ctx;
 	// }
 
-	err = avformat_write_header(oc, NULL);
-	if (err) {
-		error("Failed to write file header: %s\n", av_err2str(err));
-		goto out_close_avio;
-	}
-
 	octx->file_oformat = file_oformat;
 	octx->oc = oc;
 	octx->avctx = avctx;
 
 	goto out;
-	out_close_avio:
-		avio_closep(&oc->pb);
 	out_free_codec_ctx:
 		avcodec_free_context(&avctx);
 	out_free_format_ctx:
@@ -274,9 +253,9 @@ static void close_encoder(EncoderPrivateContext *octx) {
 	if (octx->oc) {
 		avio_closep(&octx->oc->pb);
 		avformat_free_context(octx->oc);
-		octx->oc = NULL;
 	}
 	avcodec_free_context(&octx->avctx);
+	memset(octx, '\0', sizeof(*octx));
 }
 
 #define BUFSIZE 16
@@ -348,7 +327,7 @@ static void update_heartbeat(Heartbeat *hb) {
 
 static int check_heartbeat(Heartbeat *hb, const char *who) {
 	time_t heartbeat = __sync_fetch_and_add(&hb->atomic_heartbeat, 0);
-	if (time(NULL) - heartbeat > 5) {
+	if (time(NULL) - heartbeat > HEARTBEAT_TIMEOUT_S) {
 		error("Heartbeat timeout for %s\n", who);
 		return 1;
 	}
@@ -435,6 +414,11 @@ typedef struct EncoderContext {
 	SharedContext *shctx;
 } EncoderContext;
 
+typedef enum EncoderState {
+	ENCODER_STATE_RUN      = 0x1,
+	ENCODER_STATE_FLUSH    = 0x2
+} EncoderState;
+
 static int encoder_main(ThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	EncoderPrivateContext octx = {0};
@@ -444,6 +428,9 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 	AVPacket *packet = NULL;
 	int64_t packet_count = 0;
 	unsigned int stream_index = 0;
+	EncoderState state = 0;
+	uint8_t filename_index = 0;
+	char filename_indexed[PATH_MAX];
 
 	frame = av_frame_alloc();
 	if (!frame) {
@@ -457,35 +444,81 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 		goto fail;
 	}
 
+	encode:
+
 	for (;;) {
 		info("Write packet count %" PRIi64 "\n", packet_count);
 
-		THREAD_WITH_BUF_READ(thread, buf, AVFrame,
-			av_frame_move_ref(frame, entry);
-			av_frame_unref(entry);
-			info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
-		);
+		if (flush_now) {
+			flush_now = 0;
+			goto done;
+		}
 
-		if (!octx.oc) {
-			err = open_encoder(&octx, filename, ctx->shctx, frame->format, frame->width, frame->height);
-			if (err < 0)
+		if (state & ENCODER_STATE_FLUSH) {
+			err = avcodec_send_frame(octx.avctx, NULL);
+			if (err) {
+				error("avcodec_send_frame failed when flushing: %s\n", av_err2str(err));
 				goto fail;
+			}
 		}
+		else {
+			THREAD_WITH_BUF_READ(thread, buf, AVFrame,
+				av_frame_move_ref(frame, entry);
+				av_frame_unref(entry);
+				info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
+			);
 
-		frame->pict_type = AV_PICTURE_TYPE_NONE;
+			if (!octx.oc) {
+				sprintf(filename_indexed, "%s%04u%s", filename_prefix, filename_index, filename_suffix);
+				filename_index++;
+				err = open_encoder(&octx, filename_indexed, ctx->shctx, frame->format, frame->width, frame->height);
+				if (err < 0)
+					goto fail;
+			}
 
-		err = avcodec_send_frame(octx.avctx, frame);
-		if (err) {
-			error("avcodec_send_frame failed: %s\n", av_err2str(err));
-			goto fail;
+			if (!(state & ENCODER_STATE_RUN)) {
+				err = unlink(filename_indexed);
+				if (!err || (err && errno == ENOENT)) {
+					// OK
+				}
+				else {
+					error("Failed to unlink %s: %s\n", filename_indexed, strerror(errno));
+					goto fail;
+				}
+
+				err = avio_open(&octx.oc->pb, filename_indexed, AVIO_FLAG_WRITE);
+				if (err) {
+					error("Failed to open output file '%s': %s\n", filename_indexed, av_err2str(err));
+					goto fail;
+				}
+
+				err = avformat_write_header(octx.oc, NULL);
+				if (err) {
+					error("Failed to write file header: %s\n", av_err2str(err));
+					goto fail;
+				}
+
+				state |= ENCODER_STATE_RUN;
+			}
+
+			frame->pict_type = AV_PICTURE_TYPE_NONE;
+
+			err = avcodec_send_frame(octx.avctx, frame);
+			if (err) {
+				error("avcodec_send_frame failed: %s\n", av_err2str(err));
+				goto fail;
+			}
+
+			av_frame_unref(frame);
 		}
-
-		av_frame_unref(frame);
 
 		for (;;) {
 			err = avcodec_receive_packet(octx.avctx, packet);
 			if (err == AVERROR(EAGAIN)) {
 				break;
+			}
+			else if (err == AVERROR_EOF) {
+				goto write_trailer;
 			}
 			else if (err) {
 				error("avcodec_receive_packet failed: %s\n", av_err2str(err));
@@ -508,14 +541,12 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 	done:
 
+	state |= ENCODER_STATE_FLUSH;
+
 	info("Finalizing output after %" PRIi64 " packets\n", packet_count);
 
-	err = avcodec_send_frame(octx.avctx, NULL);
-	if (err) {
-		error("avcodec_send_frame failed when flushing: %s\n", av_err2str(err));
-		goto fail;
-	}
-
+	goto encode;
+/*
 	for (;;) {
 		err = avcodec_receive_packet(octx.avctx, packet);
 		if (err == AVERROR_EOF) {
@@ -539,6 +570,8 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 
 		av_packet_unref(packet);
 	}
+*/
+	write_trailer:
 
 	info("Packet count after finalizing: %" PRIi64 " packets\n", packet_count);
 
@@ -548,7 +581,11 @@ static int encoder_main(ThreadContext *thread, void *arg) {
 		goto fail;
 	}
 
-	ctx->shctx->encoder_flushed = 1;
+	if (!stop_now) {
+		close_encoder(&octx);
+		state &= ~(ENCODER_STATE_FLUSH|ENCODER_STATE_RUN);
+		goto encode;
+	}
 
 	goto out;
 	fail:
@@ -681,6 +718,10 @@ static void signal_handler(int sig) {
 		case SIGINT:
 			info("Received SIGINT\n");
 			break;
+		case SIGUSR1:
+			info("Received SIGUSR1\n");
+			flush_now = 1;
+			return;
 		default:
 			assert(0 && "Unknown signal");
 			abort();
@@ -716,6 +757,10 @@ int main(int argc, const char **argv) {
 		abort();
 	}
 	if (signal(SIGINT, signal_handler) == SIG_ERR) {
+		error("Failed to bind signal handler");
+		abort();
+	}
+	if (signal(SIGUSR1, signal_handler) == SIG_ERR) {
 		error("Failed to bind signal handler");
 		abort();
 	}

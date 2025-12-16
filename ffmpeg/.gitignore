@@ -3,3 +3,5 @@ testvideo.mp4
 test_out.mp4
 .project
 .clang-format
+vgcore.*
+test_out*
