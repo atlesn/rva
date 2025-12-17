@@ -5,3 +5,16 @@ test_out.mp4
 .clang-format
 vgcore.*
 test_out*
+autom4te.cache/
+configure
+configure~
+Makefile
+Makefile.in
+aclocal.m4
+compile
+install-sh
+missing
+config.log
+config.status
+rva
+*.o
