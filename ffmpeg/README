@@ -1,0 +1,36 @@
+==================================================================
+= RTSP Video Archiver (rva)                                      =
+==================================================================
+
+This program continously reads from an RTSP stream and saves video
+into files on disk.
+
+To change the URL for the RTSP server or the output file name,
+edit the source file `rva.c`.
+
+Output file names will be appended with an -nnnn suffix where
+nnnn is an index starting with zero when the program first
+starts up. Whenever the program receives SIGUSR1 signal, the
+file will be closed and saving will commence at the next index.
+The index will wrap after 0255 and begin at zero. Existing
+files will be deleted.
+
+If the program receives SIGINT, the currently open file will be
+finalized and closed before the program quits. If two SIGINTs
+are received, the program will quit immediately.
+
+Dependencies
+------------
+ffmpeg libraries and headers
+
+Build
+-----
+
+autoreconf -i
+./configure
+make
+
+Run
+---
+
+./rva
