@@ -896,21 +896,33 @@ int rva_run(
 	for (int i = 0; i < thread_count; i++) {
 		RVAThreadContext *thread = &threads[i];
 
+		if (!thread->main)
+			continue;
+
 		err = rva_start_thread(thread);
 		if (err)
 			goto fail;
 	}
 
 	for (;;) {
+		int running = 0;
+
 		for (int i = 0; i < thread_count; i++) {
 			RVAThreadContext *thread = &threads[i];
+
+			if (!thread->running)
+				continue;
+			running = 1;
+
 			if (rva_thread_check_heartbeat(thread)) {
 				goto fail;
 			}
 		}
-		if (*stop_now || *thread_exited) {
+
+		if (*stop_now || *thread_exited || !running) {
 			break;
 		}
+
 		usleep(100 * 1000);
 	}
 

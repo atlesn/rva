@@ -69,10 +69,6 @@ static void signal_handler(int sig) {
 
 int main(int argc, const char **argv) {
 	int err, ret = EXIT_SUCCESS;
-	void *res;
-
-	(void)(argc);
-	(void)(argv);
 
 	RVASharedContext shctx = {0};
 	RVAInputContext ictx = {0};
@@ -82,6 +78,10 @@ int main(int argc, const char **argv) {
 	RVAThreadContext threads[THREAD_COUNT];
 
 	memset(threads, '\0', sizeof(threads));
+
+	if (argc != 2) {
+		goto usage;
+	}
 
 	if (signal(SIGTERM, signal_handler) == SIG_ERR) {
 		rva_error("Failed to bind signal handler");
@@ -100,19 +100,29 @@ int main(int argc, const char **argv) {
 	if (err)
 		goto fail;
 
-	err = rva_open_input(&ictx, url);
-	if (err)
-		goto fail;
+	if (!strcmp(argv[1], "rtsp")) {
+		err = rva_open_input(&ictx, url);
+		if (err)
+			goto fail;
 
-	rva_init_reader(&reader_ctx, &threads[THREAD_READER], &stop_now, &thread_exited, &ictx, &shctx.packet_buf);
-	rva_init_decoder(&decoder_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, &ictx, filterdescr, &shctx.packet_buf, &shctx.frame_buf);
-	rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
+		rva_init_reader(&reader_ctx, &threads[THREAD_READER], &stop_now, &thread_exited, &ictx, &shctx.packet_buf);
+		rva_init_decoder(&decoder_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, &ictx, filterdescr, &shctx.packet_buf, &shctx.frame_buf);
+		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
+	}
+	else if (!strcmp(argv[1], "dummy")) {
+	}
+	else {
+		rva_error("Unknown mode '%s'\n", argv[1]);
+		goto usage;
+	}
 
 	err = rva_run(threads, THREAD_COUNT, &stop_now, &thread_exited);
 	if (err)
 		goto fail;
 
 	goto out;
+	usage:
+		rva_error("Usage: %s {rtsp|dummy}\n", argv[0]);
 	fail:
 		ret = EXIT_FAILURE;
 	out:
