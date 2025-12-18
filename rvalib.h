@@ -76,6 +76,12 @@ typedef struct RVADecoderContext {
 	RVAPacketBuffer *packet_buf;
 } RVADecoderContext;
 
+typedef struct RVAGeneratorContext {
+	enum AVCodecID codec_id;
+	const char *filterdescr;
+	RVAFrameBuffer *frame_buf;
+} RVAGeneratorContext;
+
 typedef struct RVAReaderContext {
 	AVFormatContext *ic;
 	RVAPacketBuffer *packet_buf;
@@ -126,6 +132,14 @@ void rva_init_decoder(
 		const RVAInputContext *ictx,
 		const char *filterdescr,
 		RVAPacketBuffer *packet_buf,
+		RVAFrameBuffer *frame_buf
+);
+void rva_init_generator(
+		RVAGeneratorContext *dctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const char *filterdescr,
 		RVAFrameBuffer *frame_buf
 );
 void rva_init_encoder(

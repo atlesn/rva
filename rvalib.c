@@ -23,6 +23,7 @@
 #include "rvalib.h"
 
 #include <assert.h>
+#include <libavutil/pixfmt.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -104,7 +105,7 @@
 	BUF_READ_END(buf);                      \
 	pthread_mutex_unlock(&buf->mutex);
 
-static const int HEARTBEAT_TIMEOUT_S = 600;
+static const int HEARTBEAT_TIMEOUT_S = 5;
 
 typedef struct RVAEncoderPrivateContext {
 	AVFormatContext *oc;
@@ -754,6 +755,63 @@ static int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 		return ret;
 }
 
+static int rva_generator_main(RVAThreadContext *thread, void *arg) {
+	int err, ret = 0;
+	RVAGeneratorContext *ctx = arg;
+	RVAFilterContext fctx = {0};
+	AVFrame *filt_frame = NULL;
+	RVAFrameBuffer *frame_buf = ctx->frame_buf;
+
+	filt_frame = av_frame_alloc();
+	if (!filt_frame) {
+		rva_error("Failed to allocate frame\n");
+		goto fail;
+	}
+
+	AVRational time_base = {
+		.num = 1,
+		.den = 90000
+	};
+	AVRational aspect_ratio = {
+		.num = 1,
+		.den = 1
+	};
+
+	err = rva_open_filter(&fctx, ctx->filterdescr,
+		1280, 720,
+		AV_PIX_FMT_YUV420P, time_base, aspect_ratio);
+	if (err)
+		goto fail;
+
+	for (;;) {
+		again:
+		err = av_buffersink_get_frame(fctx.buffersink_ctx, filt_frame);
+		if (err == AVERROR(EAGAIN)) {
+			usleep(100 * 1000);
+			goto again;
+		}
+		else if (err == AVERROR_EOF) {
+			break;
+		}
+		else if (err < 0) {
+			rva_error("Failed to get frame from filter graph\n");
+			goto fail;
+		}
+		THREAD_WITH_BUF_WRITE(thread, frame_buf, AVFrame,
+			av_frame_move_ref(entry, filt_frame);
+		);
+	}
+
+	goto done;
+	fail:
+		ret = 1;
+	done:
+		rva_info("Generator thread exiting\n");
+		rva_close_filter(&fctx);
+		av_frame_free(&filt_frame);
+		return ret;
+}
+
 static int rva_reader_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAReaderContext *ctx = arg;
@@ -853,6 +911,27 @@ void rva_init_decoder(
 	tctx->arg = dctx;
 	tctx->main = rva_decoder_main;
 	tctx->name = "decoder thread";
+	tctx->stop_now = stop_now;
+	tctx->thread_exited = thread_exited;
+}
+
+void rva_init_generator(
+		RVAGeneratorContext *gctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const char *filterdescr,
+		RVAFrameBuffer *frame_buf
+) {
+	memset(gctx, '\0', sizeof(*gctx));
+	memset(tctx, '\0', sizeof(*tctx));
+
+	gctx->filterdescr = filterdescr,
+	gctx->frame_buf = frame_buf;
+
+	tctx->arg = gctx;
+	tctx->main = rva_generator_main;
+	tctx->name = "generator thread";
 	tctx->stop_now = stop_now;
 	tctx->thread_exited = thread_exited;
 }

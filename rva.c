@@ -74,6 +74,7 @@ int main(int argc, const char **argv) {
 	RVAInputContext ictx = {0};
 	RVAReaderContext reader_ctx = {0};
 	RVADecoderContext decoder_ctx = {0};
+	RVAGeneratorContext generator_ctx = {0};
 	RVAEncoderContext encoder_ctx = {0};
 	RVAThreadContext threads[THREAD_COUNT];
 
@@ -110,6 +111,8 @@ int main(int argc, const char **argv) {
 		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
 	}
 	else if (!strcmp(argv[1], "dummy")) {
+		rva_init_generator(&generator_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, filterdescr, &shctx.frame_buf);
+		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
 	}
 	else {
 		rva_error("Unknown mode '%s'\n", argv[1]);
