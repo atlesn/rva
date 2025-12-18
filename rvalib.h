@@ -103,10 +103,6 @@ typedef struct RVAThreadContext {
 void rva_error(const char *format, ...);
 void rva_info(const char *format, ...);
 
-void rva_thread_heartbeat(RVAThreadContext *ctx);
-int rva_thread_check_heartbeat(RVAThreadContext *ctx);
-int rva_start_thread(RVAThreadContext *thread);
-
 int rva_open_input(RVAInputContext *ictx, const char *url);
 void rva_close_input(RVAInputContext *ictx);
 
@@ -142,6 +138,13 @@ void rva_init_encoder(
 		volatile int *flush_now,
 		RVAFrameBuffer *frame_buf,
 		AVRational time_base
+);
+
+int rva_run(
+		RVAThreadContext *threads,
+		int thread_count,
+		volatile int *stop_now,
+		volatile int *thread_exited
 );
 
 #endif

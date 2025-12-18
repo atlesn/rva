@@ -24,8 +24,6 @@
 
 #include <assert.h>
 #include <signal.h>
-#include <pthread.h>
-#include <unistd.h>
 
 static const char *url = "rtsp://localhost:8554/test";
 static const char *filename_prefix = "./test_out-";
@@ -70,14 +68,17 @@ static void signal_handler(int sig) {
 }
 
 int main(int argc, const char **argv) {
-	int err, ret = 0;
+	int err, ret = EXIT_SUCCESS;
+	void *res;
 
 	(void)(argc);
 	(void)(argv);
 
 	RVASharedContext shctx = {0};
 	RVAInputContext ictx = {0};
-	void *res;
+	RVAReaderContext reader_ctx = {0};
+	RVADecoderContext decoder_ctx = {0};
+	RVAEncoderContext encoder_ctx = {0};
 	RVAThreadContext threads[THREAD_COUNT];
 
 	memset(threads, '\0', sizeof(threads));
@@ -103,51 +104,18 @@ int main(int argc, const char **argv) {
 	if (err)
 		goto fail;
 
-	RVAReaderContext reader_ctx = {0};
-	RVADecoderContext decoder_ctx = {0};
-	RVAEncoderContext encoder_ctx = {0};
-
 	rva_init_reader(&reader_ctx, &threads[THREAD_READER], &stop_now, &thread_exited, &ictx, &shctx.packet_buf);
 	rva_init_decoder(&decoder_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, &ictx, filterdescr, &shctx.packet_buf, &shctx.frame_buf);
 	rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
 
-	for (int i = 0; i < THREAD_COUNT; i++) {
-		RVAThreadContext *thread = &threads[i];
-
-		err = rva_start_thread(thread);
-		if (err)
-			goto fail;
-	}
-
-	for (;;) {
-		for (int i = 0; i < THREAD_COUNT; i++) {
-			RVAThreadContext *thread = &threads[i];
-			if (rva_thread_check_heartbeat(thread)) {
-				goto fail;
-			}
-		}
-		if (stop_now || thread_exited) {
-			break;
-		}
-		usleep(100 * 1000);
-	}
+	err = rva_run(threads, THREAD_COUNT, &stop_now, &thread_exited);
+	if (err)
+		goto fail;
 
 	goto out;
 	fail:
-		ret = -1;
+		ret = EXIT_FAILURE;
 	out:
-		rva_info("Main thread exiting\n");
-		stop_now = 1;
-		for (int i = 0; i < THREAD_COUNT; i++) {
-			RVAThreadContext *thread = &threads[i];
-
-			if (thread->running) {
-				pthread_join(thread->thread, &res);
-				rva_info("Joined with %s\n", thread->name);
-				if ((intptr_t) res)
-					ret = -1;
-			}
-		}
 		rva_close_input(&ictx);
 		rva_close_shared(&shctx);
 		return ret;

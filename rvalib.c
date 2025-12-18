@@ -883,3 +883,52 @@ void rva_init_encoder(
 	tctx->stop_now = stop_now;
 	tctx->thread_exited = thread_exited;
 }
+
+int rva_run(
+		RVAThreadContext *threads,
+		int thread_count,
+		volatile int *stop_now,
+		volatile int *thread_exited
+) {
+	int err, ret = 0;
+	void *res;
+
+	for (int i = 0; i < thread_count; i++) {
+		RVAThreadContext *thread = &threads[i];
+
+		err = rva_start_thread(thread);
+		if (err)
+			goto fail;
+	}
+
+	for (;;) {
+		for (int i = 0; i < thread_count; i++) {
+			RVAThreadContext *thread = &threads[i];
+			if (rva_thread_check_heartbeat(thread)) {
+				goto fail;
+			}
+		}
+		if (*stop_now || *thread_exited) {
+			break;
+		}
+		usleep(100 * 1000);
+	}
+
+	goto out;
+	fail:
+		ret = 1;
+	out:
+		rva_info("Main thread exiting\n");
+		*stop_now = 1;
+		for (int i = 0; i < thread_count; i++) {
+			RVAThreadContext *thread = &threads[i];
+
+			if (thread->running) {
+				pthread_join(thread->thread, &res);
+				rva_info("Joined with %s\n", thread->name);
+				if ((intptr_t) res)
+					ret = 1;
+			}
+		}
+		return ret;
+}
