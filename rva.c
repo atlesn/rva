@@ -128,7 +128,6 @@ int main(int argc, const char **argv) {
 	threads[THREAD_DECODER].thread_exited = &thread_exited;
 
 	RVAEncoderContext encoder_ctx = {
-		.timebase = ictx.avctx->pkt_timebase,
 		.filename_prefix = filename_prefix,
 		.filename_suffix = filename_suffix,
 		.flush_now = &flush_now,

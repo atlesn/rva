@@ -62,7 +62,6 @@ typedef struct RVAInputContext {
 
 typedef struct RVAEncoderContext {
 	volatile int *flush_now;
-	AVRational timebase;
 	const char *filename_prefix;
 	const char *filename_suffix;
 	RVAFrameBuffer *frame_buf;
