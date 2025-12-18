@@ -110,11 +110,38 @@ int rva_start_thread(RVAThreadContext *thread);
 int rva_open_input(RVAInputContext *ictx, const char *url);
 void rva_close_input(RVAInputContext *ictx);
 
-int rva_encoder_main(RVAThreadContext *thread, void *arg);
-int rva_decoder_main(RVAThreadContext *thread, void *arg);
-int rva_reader_main(RVAThreadContext *thread, void *arg);
-
 int rva_open_shared(RVASharedContext *ctx);
 void rva_close_shared(RVASharedContext *ctx);
+
+void rva_init_reader(
+		RVAReaderContext *rctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const RVAInputContext *ictx,
+		RVAPacketBuffer *packet_buf
+);
+
+void rva_init_decoder(
+		RVADecoderContext *dctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const RVAInputContext *ictx,
+		const char *filterdescr,
+		RVAPacketBuffer *packet_buf,
+		RVAFrameBuffer *frame_buf
+);
+void rva_init_encoder(
+		RVAEncoderContext *ectx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const char *filename_prefix,
+		const char *filename_suffix,
+		volatile int *flush_now,
+		RVAFrameBuffer *frame_buf,
+		AVRational time_base
+);
 
 #endif

@@ -103,43 +103,13 @@ int main(int argc, const char **argv) {
 	if (err)
 		goto fail;
 
-	RVAReaderContext reader_ctx = {
-		.ic = ictx.ic,
-		.packet_buf = &shctx.packet_buf
-	};
+	RVAReaderContext reader_ctx = {0};
+	RVADecoderContext decoder_ctx = {0};
+	RVAEncoderContext encoder_ctx = {0};
 
-	threads[THREAD_READER].arg = &reader_ctx;
-	threads[THREAD_READER].main = rva_reader_main;
-	threads[THREAD_READER].name = "reader thread";
-	threads[THREAD_READER].stop_now = &stop_now;
-	threads[THREAD_READER].thread_exited = &thread_exited;
-
-	RVADecoderContext decoder_ctx = {
-		.avctx = ictx.avctx,
-		.filterdescr = filterdescr,
-		.packet_buf = &shctx.packet_buf,
-		.frame_buf = &shctx.frame_buf
-	};
-
-	threads[THREAD_DECODER].arg = &decoder_ctx;
-	threads[THREAD_DECODER].main = rva_decoder_main;
-	threads[THREAD_DECODER].name = "decoder thread";
-	threads[THREAD_DECODER].stop_now = &stop_now;
-	threads[THREAD_DECODER].thread_exited = &thread_exited;
-
-	RVAEncoderContext encoder_ctx = {
-		.filename_prefix = filename_prefix,
-		.filename_suffix = filename_suffix,
-		.flush_now = &flush_now,
-		.frame_buf = &shctx.frame_buf,
-		.time_base = ictx.time_base
-	};
-
-	threads[THREAD_ENCODER].arg = &encoder_ctx;
-	threads[THREAD_ENCODER].main = rva_encoder_main;
-	threads[THREAD_ENCODER].name = "encoder thread";
-	threads[THREAD_ENCODER].stop_now = &stop_now;
-	threads[THREAD_ENCODER].thread_exited = &thread_exited;
+	rva_init_reader(&reader_ctx, &threads[THREAD_READER], &stop_now, &thread_exited, &ictx, &shctx.packet_buf);
+	rva_init_decoder(&decoder_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, &ictx, filterdescr, &shctx.packet_buf, &shctx.frame_buf);
+	rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
 
 	for (int i = 0; i < THREAD_COUNT; i++) {
 		RVAThreadContext *thread = &threads[i];

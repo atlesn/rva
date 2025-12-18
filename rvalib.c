@@ -503,7 +503,7 @@ void rva_close_encoder(RVAEncoderPrivateContext *octx) {
 	memset(octx, '\0', sizeof(*octx));
 }
 
-int rva_encoder_main(RVAThreadContext *thread, void *arg) {
+static int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAEncoderPrivateContext octx = {0};
 	RVAEncoderContext *ctx = arg;
@@ -663,7 +663,7 @@ int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 		return ret;
 }
 
-int rva_decoder_main(RVAThreadContext *thread, void *arg) {
+static int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVADecoderContext *ctx = arg;
 	RVAFilterContext fctx = {0};
@@ -754,7 +754,7 @@ int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 		return ret;
 }
 
-int rva_reader_main(RVAThreadContext *thread, void *arg) {
+static int rva_reader_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAReaderContext *ctx = arg;
 	RVAPacketBuffer *buf = ctx->packet_buf;
@@ -811,3 +811,75 @@ void rva_close_shared(RVASharedContext *ctx) {
 	BUF_FREE(ctx->packet_buf, AVPacket, av_packet_free);
 }
 
+void rva_init_reader(
+		RVAReaderContext *rctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const RVAInputContext *ictx,
+		RVAPacketBuffer *packet_buf
+) {
+	memset(rctx, '\0', sizeof(*rctx));
+	memset(tctx, '\0', sizeof(*tctx));
+
+	rctx->ic = ictx->ic;
+	rctx->packet_buf = packet_buf;
+
+	tctx->arg = rctx;
+	tctx->main = rva_reader_main;
+	tctx->name = "reader thread";
+	tctx->stop_now = stop_now;
+	tctx->thread_exited = thread_exited;
+}
+
+void rva_init_decoder(
+		RVADecoderContext *dctx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const RVAInputContext *ictx,
+		const char *filterdescr,
+		RVAPacketBuffer *packet_buf,
+		RVAFrameBuffer *frame_buf
+) {
+	memset(dctx, '\0', sizeof(*dctx));
+	memset(tctx, '\0', sizeof(*tctx));
+
+	dctx->avctx = ictx->avctx,
+	dctx->filterdescr = filterdescr,
+	dctx->packet_buf = packet_buf;
+	dctx->frame_buf = frame_buf;
+
+	tctx->arg = dctx;
+	tctx->main = rva_decoder_main;
+	tctx->name = "decoder thread";
+	tctx->stop_now = stop_now;
+	tctx->thread_exited = thread_exited;
+}
+
+void rva_init_encoder(
+		RVAEncoderContext *ectx,
+		RVAThreadContext *tctx,
+		volatile int *stop_now,
+		volatile int *thread_exited,
+		const char *filename_prefix,
+		const char *filename_suffix,
+		volatile int *flush_now,
+		RVAFrameBuffer *frame_buf,
+		AVRational time_base
+) {
+	memset(ectx, '\0', sizeof(*ectx));
+	memset(tctx, '\0', sizeof(*tctx));
+
+	ectx->filename_prefix = filename_prefix;
+	ectx->filename_suffix = filename_suffix;
+	ectx->flush_now = flush_now;
+	ectx->frame_buf = frame_buf;
+	ectx->time_base = time_base;
+
+	tctx->arg = ectx;
+	tctx->main = rva_encoder_main;
+	tctx->name = "encoder thread";
+	tctx->stop_now = stop_now;
+	tctx->thread_exited = thread_exited;
+}
