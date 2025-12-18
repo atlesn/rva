@@ -54,30 +54,32 @@ typedef struct RVASharedContext {
 } RVASharedContext;
 
 typedef struct RVAInputContext {
-	RVASharedContext *shctx;
 	const AVInputFormat *file_iformat;
 	AVFormatContext *ic;
 	AVCodecContext *avctx;
+	AVRational time_base;
 } RVAInputContext;
 
 typedef struct RVAEncoderContext {
 	volatile int *flush_now;
-	RVASharedContext *shctx;
 	AVRational timebase;
 	const char *filename_prefix;
 	const char *filename_suffix;
+	RVAFrameBuffer *frame_buf;
+	AVRational time_base;
 } RVAEncoderContext;
 
 typedef struct RVADecoderContext {
-	RVASharedContext *shctx;
 	enum AVCodecID codec_id;
 	AVCodecContext *avctx;
 	const char *filterdescr;
+	RVAFrameBuffer *frame_buf;
+	RVAPacketBuffer *packet_buf;
 } RVADecoderContext;
 
 typedef struct RVAReaderContext {
-	RVASharedContext *shctx;
 	AVFormatContext *ic;
+	RVAPacketBuffer *packet_buf;
 } RVAReaderContext;
 
 typedef struct RVAHeartbeat {

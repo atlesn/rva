@@ -76,9 +76,7 @@ int main(int argc, const char **argv) {
 	(void)(argv);
 
 	RVASharedContext shctx = {0};
-	RVAInputContext ictx = {
-		.shctx = &shctx
-	};
+	RVAInputContext ictx = {0};
 	void *res;
 	RVAThreadContext threads[THREAD_COUNT];
 
@@ -106,8 +104,8 @@ int main(int argc, const char **argv) {
 		goto fail;
 
 	RVAReaderContext reader_ctx = {
-		.shctx = &shctx,
-		.ic = ictx.ic
+		.ic = ictx.ic,
+		.packet_buf = &shctx.packet_buf
 	};
 
 	threads[THREAD_READER].arg = &reader_ctx;
@@ -117,9 +115,10 @@ int main(int argc, const char **argv) {
 	threads[THREAD_READER].thread_exited = &thread_exited;
 
 	RVADecoderContext decoder_ctx = {
-		.shctx = &shctx,
 		.avctx = ictx.avctx,
-		.filterdescr = filterdescr
+		.filterdescr = filterdescr,
+		.packet_buf = &shctx.packet_buf,
+		.frame_buf = &shctx.frame_buf
 	};
 
 	threads[THREAD_DECODER].arg = &decoder_ctx;
@@ -129,12 +128,12 @@ int main(int argc, const char **argv) {
 	threads[THREAD_DECODER].thread_exited = &thread_exited;
 
 	RVAEncoderContext encoder_ctx = {
-		.shctx = &shctx,
 		.timebase = ictx.avctx->pkt_timebase,
-		.shctx = &shctx,
 		.filename_prefix = filename_prefix,
 		.filename_suffix = filename_suffix,
-		.flush_now = &flush_now
+		.flush_now = &flush_now,
+		.frame_buf = &shctx.frame_buf,
+		.time_base = ictx.time_base
 	};
 
 	threads[THREAD_ENCODER].arg = &encoder_ctx;

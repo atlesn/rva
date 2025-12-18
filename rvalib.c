@@ -277,7 +277,7 @@ int rva_open_input(RVAInputContext *ictx, const char *url) {
 	ictx->file_iformat = file_iformat;
 	ictx->ic = ic;
 	ictx->avctx = avctx;
-	ictx->shctx->time_base = stream->time_base;
+	ictx->time_base = stream->time_base;
 
 	goto out;
 	out_free_codec_ctx:
@@ -398,7 +398,7 @@ void rva_close_filter(RVAFilterContext *fctx) {
 static int rva_open_encoder(
 		RVAEncoderPrivateContext *octx,
 		const char *filename,
-		const RVASharedContext *shctx,
+		AVRational time_base,
 		enum AVPixelFormat pixel_format,
 		int width,
 		int height
@@ -415,7 +415,7 @@ static int rva_open_encoder(
 	getcwd(cwd, sizeof(cwd));
 	rva_info("CWD: %s\n", cwd);
 
-	rva_info("Open output timebase %i/%i format %i\n", shctx->time_base.num, shctx->time_base.den, pixel_format);
+	rva_info("Open output timebase %i/%i format %i\n", time_base.num, time_base.den, pixel_format);
 
 	file_oformat = av_guess_format("mp4", NULL, NULL);
 	if (!file_oformat) {
@@ -448,7 +448,7 @@ static int rva_open_encoder(
 	}
 
 	avctx->codec_id = codec->id;
-	avctx->time_base = shctx->time_base;
+	avctx->time_base = time_base;
 	avctx->pix_fmt = pixel_format;
 	avctx->width = width;
 	avctx->height = height;
@@ -507,7 +507,7 @@ int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAEncoderPrivateContext octx = {0};
 	RVAEncoderContext *ctx = arg;
-	RVAFrameBuffer *buf = &ctx->shctx->frame_buf;
+	RVAFrameBuffer *buf = ctx->frame_buf;
 	AVFrame *frame = NULL;
 	AVPacket *packet = NULL;
 	int64_t packet_count = 0;
@@ -554,7 +554,7 @@ int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 				sprintf(filename_indexed, "%s%04u%s", ctx->filename_prefix, filename_index, ctx->filename_suffix);
 				rva_info("Using output file %s\n", filename_indexed);
 				filename_index++;
-				err = rva_open_encoder(&octx, filename_indexed, ctx->shctx, frame->format, frame->width, frame->height);
+				err = rva_open_encoder(&octx, filename_indexed, ctx->time_base, frame->format, frame->width, frame->height);
 				if (err)
 					goto fail;
 			}
@@ -669,8 +669,8 @@ int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 	RVAFilterContext fctx = {0};
 	AVFrame *frame = NULL, *filt_frame = NULL;
 	AVPacket *packet = NULL;
-	RVAPacketBuffer *packet_buf = &ctx->shctx->packet_buf;
-	RVAFrameBuffer *frame_buf = &ctx->shctx->frame_buf;
+	RVAPacketBuffer *packet_buf = ctx->packet_buf;
+	RVAFrameBuffer *frame_buf = ctx->frame_buf;
 
 	frame = av_frame_alloc();
 	if (!frame) {
@@ -757,7 +757,7 @@ int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 int rva_reader_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAReaderContext *ctx = arg;
-	RVAPacketBuffer *buf = &ctx->shctx->packet_buf;
+	RVAPacketBuffer *buf = ctx->packet_buf;
 	AVPacket *packet = NULL;
 
 	packet = av_packet_alloc();
