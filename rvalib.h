@@ -29,6 +29,7 @@
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavutil/rational.h>
 
 #define BUFSIZE 16
 
@@ -78,8 +79,10 @@ typedef struct RVADecoderContext {
 
 typedef struct RVAGeneratorContext {
 	enum AVCodecID codec_id;
-	const char *filterdescr;
+	int width;
+	int height;
 	RVAFrameBuffer *frame_buf;
+	AVRational time_base;
 } RVAGeneratorContext;
 
 typedef struct RVAReaderContext {
@@ -139,8 +142,10 @@ void rva_init_generator(
 		RVAThreadContext *tctx,
 		volatile int *stop_now,
 		volatile int *thread_exited,
-		const char *filterdescr,
-		RVAFrameBuffer *frame_buf
+		int width,
+		int height,
+		RVAFrameBuffer *frame_buf,
+		AVRational time_base
 );
 void rva_init_encoder(
 		RVAEncoderContext *ectx,

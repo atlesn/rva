@@ -24,9 +24,11 @@
 
 #include <assert.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/pixdesc.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #define BUF_WRITE_BEGIN(buf, type) do {         \
 	type *entry = buf->entries[buf->wpos];
@@ -297,8 +299,9 @@ void rva_close_input(RVAInputContext *ictx) {
 	avcodec_free_context(&ictx->avctx);
 }
 
-int rva_open_filter(
+static int rva_open_filter(
 		RVAFilterContext *fctx,
+		int have_source,
 		const char *filterdescr,
 		int width,
 		int height,
@@ -315,7 +318,8 @@ int rva_open_filter(
 	AVFilterGraph *filter_graph = NULL;
 	AVFilterContext *buffersrc_ctx = NULL;
 	AVFilterContext *buffersink_ctx = NULL;
-	char args[512];
+	char args_in[512];
+	char args_filter[512];
 
 	outputs = avfilter_inout_alloc();
 	inputs = avfilter_inout_alloc();
@@ -326,13 +330,31 @@ int rva_open_filter(
 		goto fail;
 	}
 
-	sprintf(args, "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-		width, height, pixel_format, time_base.num, time_base.den, sample_aspect_ratio.num, sample_aspect_ratio.den);
+	if (have_source) {
+		sprintf(args_in, "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+			width, height, pixel_format, time_base.num, time_base.den, sample_aspect_ratio.num, sample_aspect_ratio.den);
+		sprintf(args_filter, "%s", filterdescr);
 
-	err = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args, NULL, filter_graph);
-	if (err) {
-		rva_error("Failed to create filter buffer source context\n");
-		goto fail;
+		err = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args_in, NULL, filter_graph);
+		if (err) {
+			rva_error("Failed to create filter buffer source context\n");
+			goto fail;
+		}
+
+		outputs->name       = av_strdup("in");
+		outputs->filter_ctx = buffersrc_ctx;
+		outputs->pad_idx    = 0;
+		outputs->next       = NULL;
+	}
+	else {
+		assert(time_base.num == 1);
+		sprintf(args_filter, "%s=rate=%d:size=%dx%d,format=pix_fmts=%s,setsar=%d/%d",
+			filterdescr,
+			time_base.den,
+			width, height,
+			av_get_pix_fmt_name(pixel_format),
+			sample_aspect_ratio.num, sample_aspect_ratio.den
+		);
 	}
 
 	buffersink_ctx = avfilter_graph_alloc_filter(filter_graph, buffersink, "out");
@@ -347,17 +369,12 @@ int rva_open_filter(
 		goto fail;
 	}
 
-	outputs->name       = av_strdup("in");
-	outputs->filter_ctx = buffersrc_ctx;
-	outputs->pad_idx    = 0;
-	outputs->next       = NULL;
-
 	inputs->name        = av_strdup("out");
 	inputs->filter_ctx  = buffersink_ctx;
 	inputs->pad_idx     = 0;
 	inputs->next        = NULL;
 
-	err = avfilter_graph_parse_ptr(filter_graph, filterdescr, &inputs, &outputs, NULL);
+	err = avfilter_graph_parse_ptr(filter_graph, args_filter, &inputs, &outputs, NULL);
 
 	fctx->buffersrc_ctx = buffersrc_ctx;
 	fctx->buffersink_ctx = buffersink_ctx;
@@ -450,6 +467,7 @@ static int rva_open_encoder(
 
 	avctx->codec_id = codec->id;
 	avctx->time_base = time_base;
+	avctx->pkt_timebase = time_base;
 	avctx->pix_fmt = pixel_format;
 	avctx->width = width;
 	avctx->height = height;
@@ -548,7 +566,8 @@ static int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 			THREAD_WITH_BUF_READ(thread, buf, AVFrame,
 				av_frame_move_ref(frame, entry);
 				av_frame_unref(entry);
-				// rva_info("Read frame to decoder wpos %d rpos %d count %d\n", buf->wpos, buf->rpos, buf->count);
+				// rva_info("Read frame to decoder wpos %d rpos %d count %d pts %li duration %li\n",
+				//	buf->wpos, buf->rpos, buf->count, frame->pts, frame->duration);
 			);
 
 			if (!octx.oc) {
@@ -587,6 +606,8 @@ static int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 
 			elapsed_s = (double) frame->pts * ((double) octx.avctx->time_base.num / (double) octx.avctx->time_base.den);
 
+			// printf("Elapsed %lf pts %li tb %i/%i\n", elapsed_s, frame->pts, frame->time_base.num, frame->time_base.den);
+
 			frame->pict_type = AV_PICTURE_TYPE_NONE;
 
 			err = avcodec_send_frame(octx.avctx, frame);
@@ -611,7 +632,9 @@ static int rva_encoder_main(RVAThreadContext *thread, void *arg) {
 				goto fail;
 			}
 
-			// rva_info("Read packet from encoder pts %lli dts %lli\n", (long long int) packet->pts, (long long int) packet->dts);
+			av_packet_rescale_ts(packet, octx.avctx->time_base, octx.oc->streams[0]->time_base);
+
+			// rva_info("Read packet from encoder pts %lli dts %lli tb %i/%i\n", (long long int) packet->pts, (long long int) packet->dts, packet->time_base.num, packet->time_base.den);
 
 			err = av_interleaved_write_frame(octx.oc, packet);
 			if (err) {
@@ -685,7 +708,7 @@ static int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 		goto fail;
 	}
 
-	err = rva_open_filter(&fctx, ctx->filterdescr,
+	err = rva_open_filter(&fctx, 1 /* Has source */, ctx->filterdescr,
 		ctx->avctx->width, ctx->avctx->height,
 		ctx->avctx->pix_fmt, ctx->avctx->pkt_timebase, ctx->avctx->sample_aspect_ratio);
 	if (err)
@@ -755,6 +778,18 @@ static int rva_decoder_main(RVAThreadContext *thread, void *arg) {
 		return ret;
 }
 
+static int64_t rva_get_time(void) {
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+
+	int64_t tv_sec = tv.tv_sec;
+	int64_t tv_factor = 1000000;
+	int64_t tv_usec = tv.tv_usec;
+
+	return tv_sec * tv_factor + tv_usec;
+}
+
 static int rva_generator_main(RVAThreadContext *thread, void *arg) {
 	int err, ret = 0;
 	RVAGeneratorContext *ctx = arg;
@@ -768,20 +803,21 @@ static int rva_generator_main(RVAThreadContext *thread, void *arg) {
 		goto fail;
 	}
 
-	AVRational time_base = {
-		.num = 1,
-		.den = 90000
-	};
 	AVRational aspect_ratio = {
 		.num = 1,
 		.den = 1
 	};
 
-	err = rva_open_filter(&fctx, ctx->filterdescr,
-		1280, 720,
-		AV_PIX_FMT_YUV420P, time_base, aspect_ratio);
+	err = rva_open_filter(&fctx, 0 /* Has not source */, "testsrc",
+		ctx->width, ctx->height,
+		AV_PIX_FMT_YUV420P, ctx->time_base, aspect_ratio);
 	if (err)
 		goto fail;
+
+	int64_t frames = 0;
+	int64_t begin = rva_get_time();
+
+	assert(ctx->time_base.num == 1);
 
 	for (;;) {
 		again:
@@ -797,6 +833,17 @@ static int rva_generator_main(RVAThreadContext *thread, void *arg) {
 			rva_error("Failed to get frame from filter graph\n");
 			goto fail;
 		}
+
+		frames++;
+
+		int64_t now = rva_get_time();
+		int64_t expected = ((now - begin) * ctx->time_base.den) / (1 * 1000 * 1000);
+		int64_t diff = frames - expected;
+
+		if (diff > 0) {
+			usleep(((double) diff / (double) ctx->time_base.den) * 1 * 1000 * 1000);
+		}
+
 		THREAD_WITH_BUF_WRITE(thread, frame_buf, AVFrame,
 			av_frame_move_ref(entry, filt_frame);
 		);
@@ -920,14 +967,18 @@ void rva_init_generator(
 		RVAThreadContext *tctx,
 		volatile int *stop_now,
 		volatile int *thread_exited,
-		const char *filterdescr,
-		RVAFrameBuffer *frame_buf
+		int width,
+		int height,
+		RVAFrameBuffer *frame_buf,
+		AVRational time_base
 ) {
 	memset(gctx, '\0', sizeof(*gctx));
 	memset(tctx, '\0', sizeof(*tctx));
 
-	gctx->filterdescr = filterdescr,
 	gctx->frame_buf = frame_buf;
+	gctx->time_base = time_base;
+	gctx->width = width;
+	gctx->height = height;
 
 	tctx->arg = gctx;
 	tctx->main = rva_generator_main;

@@ -28,7 +28,8 @@
 static const char *url = "rtsp://localhost:8554/test";
 static const char *filename_prefix = "./test_out-";
 static const char *filename_suffix = ".mp4";
-static const char *filterdescr = "scale=1920:1080";
+static const int width = 1920;
+static const int height = 1080;
 //#static const char *url = "rtsp://viewer:viewer!!!@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
 
 static volatile int stop_now = 0;
@@ -77,6 +78,7 @@ int main(int argc, const char **argv) {
 	RVAGeneratorContext generator_ctx = {0};
 	RVAEncoderContext encoder_ctx = {0};
 	RVAThreadContext threads[THREAD_COUNT];
+	char filterdescr[512];
 
 	memset(threads, '\0', sizeof(threads));
 
@@ -106,13 +108,16 @@ int main(int argc, const char **argv) {
 		if (err)
 			goto fail;
 
+		sprintf(filterdescr, "scale=%d:%d", width, height);
+
 		rva_init_reader(&reader_ctx, &threads[THREAD_READER], &stop_now, &thread_exited, &ictx, &shctx.packet_buf);
 		rva_init_decoder(&decoder_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, &ictx, filterdescr, &shctx.packet_buf, &shctx.frame_buf);
 		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
 	}
 	else if (!strcmp(argv[1], "dummy")) {
-		rva_init_generator(&generator_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, filterdescr, &shctx.frame_buf);
-		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, ictx.time_base);
+		AVRational time_base = {1, 25};
+		rva_init_generator(&generator_ctx, &threads[THREAD_DECODER], &stop_now, &thread_exited, width, height, &shctx.frame_buf, time_base);
+		rva_init_encoder(&encoder_ctx, &threads[THREAD_ENCODER], &stop_now, &thread_exited, filename_prefix, filename_suffix, &flush_now, &shctx.frame_buf, time_base);
 	}
 	else {
 		rva_error("Unknown mode '%s'\n", argv[1]);
