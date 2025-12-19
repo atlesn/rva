@@ -25,12 +25,12 @@ ffmpeg libraries and headers
 
 Build
 -----
-
 autoreconf -i
 ./configure
 make
 
 Run
 ---
-
-./rva
+./rva rtsp
+or
+./rva dummy
